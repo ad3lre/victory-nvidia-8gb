@@ -216,23 +216,34 @@ pub fn run(
         None
     } else {
         match cfg.data_subdir("telemetry") {
-            Ok(dir) => victory_telemetry::start(victory_telemetry::Options {
-                dir,
-                title_hash: hash.to_string(),
-                console: victory_hle::console::current().name().to_owned(),
-                disabled: false,
-                log_roots: {
-                    let mut roots = vec![
-                        temp.with_file_name("crashes.log"),
-                        temp.clone(),
-                        title_dir.to_path_buf(),
-                    ];
-                    if let Some(path) = victory_core::logging::runtime_log_path() {
-                        roots.push(path.clone());
-                    }
-                    roots
-                },
-            }),
+            Ok(dir) => {
+                let event_log = dir.join("victory-events.jsonl");
+                victory_telemetry::events::set_event_log_path(event_log.clone());
+                victory_telemetry::start(victory_telemetry::Options {
+                    dir,
+                    title_hash: hash.to_string(),
+                    console: victory_hle::console::current().name().to_owned(),
+                    disabled: false,
+                    log_roots: {
+                        let mut roots = vec![
+                            temp.with_file_name("crashes.log"),
+                            temp.clone(),
+                            title_dir.to_path_buf(),
+                            event_log,
+                        ];
+                        if let Some(path) = victory_loader::per_process_crash_log() {
+                            roots.push(path);
+                        }
+                        if let Some(path) = victory_core::logging::runtime_log_path() {
+                            roots.push(path.clone());
+                            if let Some(parent) = path.parent() {
+                                roots.push(parent.to_path_buf());
+                            }
+                        }
+                        roots
+                    },
+                })
+            }
             Err(error) => {
                 tracing::warn!(%error, "telemetry directory unavailable; continuing without telemetry");
                 None

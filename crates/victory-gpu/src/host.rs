@@ -654,11 +654,11 @@ pub(crate) fn removal_context() -> String {
 /// host device removed.
 pub(crate) fn log_removal_context() {
     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !(trail_on() || dred_any()) || SAID.swap(true, Ordering::Relaxed) {
+    if !(trail_on() || obs_dred_wanted()) || SAID.swap(true, Ordering::Relaxed) {
         return;
     }
     tracing::error!("when the host device went: {}", removal_context());
-    if dred_any() {
+    if obs_dred_wanted() {
         let data = host().map(|h| h.removal_data(&[])).unwrap_or_default();
         tracing::error!("device-removed data{}", if data.is_empty() { "; none" } else { &data });
     }
@@ -835,24 +835,42 @@ pub fn on_failure(report: fn(&str) -> !) {
 }
 
 /// Ends the run on a host GPU failure: what failed, the removal reason and
-/// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
-/// diagnostics build names the command).
+/// every debug-layer ERROR so far (auto-on with telemetry in diagnostics
+/// builds; else ask for `VICTORY_D3D12_DEBUG=1`).
 pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     let mut text = what.to_string();
     if let Some(host) = host() {
         // SAFETY: a plain query.
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
+            // DRED breadcrumbs often only echo DXGI_ERROR_INVALID_CALL
+            // (0x887A0004) with no list — always stamp last-ops + trail into
+            // the crash text (and the telemetry event), not only the log.
             log_removal_context();
+            text.push_str(&format!("; {}", removal_context()));
+            let dred = host.removal_data(&[]);
+            if !dred.is_empty() {
+                text.push_str(&format!("; dred{dred}"));
+            }
         }
-        match host.log_messages() {
-            Some(first) => text.push_str(&format!("; debug layer: {first}")),
-            None if host.messages.is_none() => text.push_str(
-                "; a diagnostics build with VICTORY_D3D12_DEBUG=1 names the command",
+        match host.log_messages_all() {
+            Some(errors) if !errors.is_empty() => {
+                for (i, msg) in errors.iter().take(8).enumerate() {
+                    text.push_str(&format!(
+                        "; debug layer[{i}]: {}",
+                        msg.chars().take(1500).collect::<String>()
+                    ));
+                }
+            }
+            _ if host.messages.is_none() => text.push_str(
+                "; enable VICTORY_D3D12_DEBUG=1 (diagnostics) to name the invalid call",
             ),
-            None => {}
+            _ => {}
         }
+    } else {
+        text.push_str(&format!("; {}", removal_context()));
     }
+    text.push_str(&format!("; {}", obs_run_stamp()));
     tracing::error!("{text}");
     victory_telemetry::events::note("device_removed", &text);
     // Tests have no log: the reason goes to their output.
@@ -862,6 +880,61 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         Some(report) => report(&text),
         None => std::process::abort(),
     }
+}
+
+/// Switches / draw / library counts stamped onto every device-removed event.
+fn obs_run_stamp() -> String {
+    let (draws, dispatches) = crate::list::totals();
+    let (made, loaded, early) = crate::pipeline::library_counts();
+    let mut parts = vec![
+        format!("draws={draws}"),
+        format!("dispatches={dispatches}"),
+        format!("pipelines made={made} loaded={loaded} early={early}"),
+    ];
+    const KEYS: &[&str] = &[
+        "VICTORY_RELAY_COPY",
+        "VICTORY_RELAY",
+        "VICTORY_THIN",
+        "VICTORY_JOIN_COPIES",
+        "VICTORY_JOIN_PARTS",
+        "VICTORY_CARD_STEPS",
+        "VICTORY_INDIRECT_BATCH",
+        "VICTORY_INDIRECT_WINDOW",
+        "VICTORY_WIDE_BACK",
+        "VICTORY_WIDE_MERGE",
+        "VICTORY_UPLOAD_AHEAD",
+        "VICTORY_SHOW_AFTER",
+        "VICTORY_SKIP_PIPELINES",
+        "VICTORY_D3D12_DRED",
+        "VICTORY_D3D12_DEBUG",
+        "VICTORY_CONSOLE",
+    ];
+    for key in KEYS {
+        if let Ok(v) = std::env::var(key) {
+            parts.push(format!("{key}={v}"));
+        }
+    }
+    parts.join(" ")
+}
+
+/// Fleet / telemetry observability: diagnostics builds turn the debug layer
+/// and light DRED on whenever telemetry is alive, unless explicitly forced off.
+fn obs_telem_on() -> bool {
+    std::env::var_os("VICTORY_TELEMETRY").is_none_or(|v| v != "0")
+        || std::env::var_os("VICTORY_OBS").is_some_and(|v| v != "0")
+}
+
+fn obs_debug_layer() -> bool {
+    cfg!(feature = "diagnostics")
+        && (crate::switch::on("VICTORY_D3D12_DEBUG")
+            || (obs_telem_on() && std::env::var_os("VICTORY_D3D12_DEBUG").is_none_or(|v| v != "0")))
+}
+
+fn obs_dred_wanted() -> bool {
+    dred_any()
+        || (cfg!(feature = "diagnostics")
+            && obs_telem_on()
+            && std::env::var_os("VICTORY_D3D12_DRED").is_none_or(|v| v != "0"))
 }
 
 static HOST: OnceLock<Option<Host>> = OnceLock::new();
@@ -888,12 +961,19 @@ pub(crate) fn host() -> Option<&'static Host> {
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
-        // The debug layer only in builds with diagnostics.
-        let debug = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DEBUG");
+        // Debug layer: explicit switch, or auto with telemetry on diagnostics
+        // builds so fleet device-removed crashes name the invalid call.
+        let debug = obs_debug_layer();
         if debug {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
-                Ok(()) => layer.iter().for_each(|l| l.EnableDebugLayer()),
+                Ok(()) => {
+                    layer.iter().for_each(|l| l.EnableDebugLayer());
+                    tracing::info!(
+                        telem = obs_telem_on(),
+                        "D3D12 debug layer on (names INVALID_CALL / UAV errors on device-removed)"
+                    );
+                }
                 Err(e) => tracing::warn!(error = %e, "no D3D12 debug layer"),
             }
             // GPU-based validation (`VICTORY_D3D12_GBV`): out-of-range
@@ -915,18 +995,21 @@ fn create() -> windows::core::Result<Host> {
             }
         }
         // Diagnostics: device-removed data (the command that faulted, the
-        // faulting address), read when the device is removed.
-        if dred_any() {
+        // faulting address), read when the device is removed. Telemetry fleets
+        // get light breadcrumbs by default on diagnostics builds.
+        let want_dred = obs_dred_wanted();
+        if want_dred {
             let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
             if D3D12GetDebugInterface(&mut dred).is_ok()
                 && let Some(dred) = dred
             {
-                if dred_on() || dred_light() {
+                let crumbs = dred_on() || dred_light() || !dred_faults();
+                if crumbs {
                     dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
                 }
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
                 tracing::info!(
-                    breadcrumbs = dred_on() || dred_light(),
+                    breadcrumbs = crumbs,
                     markers = dred_on(),
                     "crash tracing on (device-removed data)"
                 );
@@ -2585,8 +2668,19 @@ fn late_exact() -> bool {
 /// or listed is presented the old way. Once every second and a half a
 /// submission settles the flights all the same, for the sweep that lets
 /// idle host objects go (it needs nothing in the air).
+/// Draws before which late-ahead presents stay off (boot / banner window).
+pub(crate) const LATE_PRESENT_AFTER_DRAWS: u64 = 500;
+
+/// Whether late-ahead present is allowed for the current draw count / late stage.
+fn late_free_present_at(late: u8, drawn: u64) -> bool {
+    late > 2 && drawn >= LATE_PRESENT_AFTER_DRAWS
+}
+
 pub(crate) fn late_free_present() -> bool {
-    late_stage() > 2
+    // Boot / character-banner window: settle the present copy so two-plane
+    // banner frames cannot race in-flight uploads (epilepsy + device-removed
+    // on 1650). Late-ahead slots only after [`LATE_PRESENT_AFTER_DRAWS`].
+    late_free_present_at(late_stage(), crate::draw::drawn())
 }
 
 /// The relay's first stage (`VICTORY_RELAY=1`; off by default; it turns
@@ -2712,7 +2806,16 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, landable};
+    use super::{LATE_PRESENT_AFTER_DRAWS, flagged_pieces, landable, late_free_present_at};
+
+    /// Boot / banner draws keep presents settled; late-ahead only after.
+    #[test]
+    fn late_free_present_waits_out_the_banner_window() {
+        assert!(!late_free_present_at(3, 0));
+        assert!(!late_free_present_at(3, LATE_PRESENT_AFTER_DRAWS - 1));
+        assert!(late_free_present_at(3, LATE_PRESENT_AFTER_DRAWS));
+        assert!(!late_free_present_at(2, LATE_PRESENT_AFTER_DRAWS));
+    }
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -6262,10 +6365,15 @@ impl Host {
     /// Moves the debug layer's messages into our log; returns the first
     /// error among them.
     pub(crate) fn log_messages(&self) -> Option<String> {
+        self.log_messages_all()?.into_iter().next()
+    }
+
+    /// All ERROR/CORRUPTION debug-layer messages (and logs every message).
+    pub(crate) fn log_messages_all(&self) -> Option<Vec<String>> {
         let Some(queue) = &self.messages else {
             return None;
         };
-        let mut first_error = None;
+        let mut errors = Vec::new();
         // SAFETY: each message is read into a buffer of the size the queue
         // reports, then the queue is emptied.
         unsafe {
@@ -6282,14 +6390,14 @@ impl Host {
                     let text = String::from_utf8_lossy(text);
                     let text = text.trim_end_matches('\0');
                     tracing::warn!(id = m.ID.0, severity = m.Severity.0, "D3D12: {text}");
-                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && first_error.is_none() {
-                        first_error = Some(text.to_owned());
+                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
+                        errors.push(text.to_owned());
                     }
                 }
             }
             queue.ClearStoredMessages();
         }
-        first_error
+        Some(errors)
     }
 
     /// A host render target view of `resource`, valid until it is recorded.

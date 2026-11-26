@@ -1877,6 +1877,7 @@ mod state {
 
 fn count_draw() {
     DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DRAWS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Draws of the kinds the host does not run yet (indirect, mesh), and
@@ -1956,6 +1957,7 @@ pub(crate) fn take_indirect() -> u64 {
 static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn count_dispatch() {
     DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DISPATCHES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 #[cfg(not(windows))]
 extern "system" fn dispatch(_: This) {
@@ -1963,12 +1965,20 @@ extern "system" fn dispatch(_: This) {
 }
 static DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DRAWS_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DISPATCHES_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Draws (any kind, mesh and indirect included) and compute dispatches
 /// recorded since the last call.
 pub(crate) fn take_counts() -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (DRAWS.swap(0, Relaxed), DISPATCHES.swap(0, Relaxed))
+}
+
+/// Lifetime draws and dispatches recorded this process (device-removed stamp).
+pub(crate) fn totals() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (DRAWS_TOTAL.load(Relaxed), DISPATCHES_TOTAL.load(Relaxed))
 }
 
 /// A GPU wait for a memory value: the list's commands after it run when

@@ -498,12 +498,22 @@ pub fn catalog() -> Vec<FlagDef> {
         FlagDef {
             key: "LOG",
             label: "Log filter",
-            help: "tracing filter, e.g. warn or victory_gpu=info,warn.",
+            help: "tracing filter, e.g. victory_gpu=info,warn.",
             category: "Diagnostics",
             kind: FlagKind::Text,
             choices: &[],
-            default: "warn",
+            default: "victory_gpu=info,victory_telemetry=info,warn",
             expert: false,
+        },
+        FlagDef {
+            key: "D3D12_DEBUG",
+            label: "D3D12 debug layer",
+            help: "Names INVALID_CALL / UAV errors on device-removed (needs Graphics Tools).",
+            category: "Diagnostics",
+            kind: FlagKind::Toggle,
+            choices: &[],
+            default: "1",
+            expert: true,
         },
         FlagDef {
             key: "CENSUS_FRAMES",
@@ -532,7 +542,7 @@ pub fn catalog() -> Vec<FlagDef> {
             category: "Diagnostics",
             kind: FlagKind::Choice,
             choices: &["", "light", "1", "faults"],
-            default: "",
+            default: "light",
             expert: true,
         },
     ]
@@ -638,7 +648,9 @@ pub fn preset_flags(id: &str) -> BTreeMap<String, String> {
             set(&mut m, "UPLOAD_AHEAD", "1");
             set(&mut m, "LEVELS_ON_DEMAND", "1");
             set(&mut m, "CARD_BUFFERS_MIN_KB", "64");
-            set(&mut m, "LOG", "warn");
+            set(&mut m, "LOG", "victory_gpu=info,victory_telemetry=info,warn");
+            set(&mut m, "D3D12_DRED", "light");
+            set(&mut m, "D3D12_DEBUG", "1");
             set(&mut m, "TEXTURE_DROP_MIPS", "2");
             set(&mut m, "NULL_COLOR", "grey");
             set(&mut m, "OVERLAY", "1");
@@ -674,7 +686,9 @@ pub fn preset_flags(id: &str) -> BTreeMap<String, String> {
             set(&mut m, "CARD_BUFFERS_MIN_KB", "64");
             set(&mut m, "OVERLAY", "1");
             set(&mut m, "TELEMETRY", "1");
-            set(&mut m, "LOG", "warn");
+            set(&mut m, "LOG", "victory_gpu=info,victory_telemetry=info,warn");
+            set(&mut m, "D3D12_DRED", "light");
+            set(&mut m, "D3D12_DEBUG", "1");
         }
     }
     m

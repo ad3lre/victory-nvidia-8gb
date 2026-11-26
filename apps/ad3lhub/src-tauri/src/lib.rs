@@ -642,6 +642,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn launch_presets_leave_relay_copy_off() {
+        for id in ["ad3l-balanced", "pareto", "series-s-low", "nvidia-8gb", "blank"] {
+            let flags = preset_flags(id);
+            assert!(
+                !flags.contains_key("RELAY_COPY") || flags.get("RELAY_COPY").is_some_and(|v| v == "0"),
+                "{id} must not enable RELAY_COPY by default"
+            );
+            let env = resolve_env(&LaunchPlan {
+                preset: id.to_string(),
+                ..Default::default()
+            });
+            assert_ne!(env.get("VICTORY_RELAY_COPY").map(String::as_str), Some("1"), "{id}");
+        }
+    }
+
+    #[test]
     fn warm_pipelines_defaults_on_for_new_and_legacy_settings() {
         assert!(Settings::default().warm_pipelines);
         // Minimal saved settings (camelCase): omit warmPipelines → default true.

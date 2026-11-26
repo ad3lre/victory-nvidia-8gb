@@ -42,13 +42,42 @@ pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
     let _ = SAVE.set(ranges);
 }
 
+/// Where crash reports go: a per-process file (upload-friendly) plus the
+/// legacy sticky path truncated at process start so earlier PIDs do not mix in.
+struct CrashLogs {
+    /// `victory-{unix}-{pid}.crash.log` beside the legacy file.
+    per_process: std::path::PathBuf,
+    /// Legacy `crashes.log` (truncated when this process claims it).
+    legacy: std::path::PathBuf,
+}
+
 /// The file crash reports are appended to, besides being printed.
-static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+static LOG: std::sync::OnceLock<CrashLogs> = std::sync::OnceLock::new();
 
 /// Also appends every unhandled-exception report and panic to `file`, so a
 /// crash can be read after the console is gone.
 pub fn log_crashes_to(file: std::path::PathBuf) {
-    if LOG.set(file).is_ok() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let per_process = file.with_file_name(format!(
+        "victory-{now}-{}.crash.log",
+        std::process::id()
+    ));
+    // This process owns a clean legacy file; prior launches' PIDs stay in
+    // their own `victory-*-*.crash.log` siblings for upload.
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&file);
+    if LOG
+        .set(CrashLogs {
+            per_process,
+            legacy: file,
+        })
+        .is_ok()
+    {
         let print = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             print(info);
@@ -70,22 +99,29 @@ pub fn log_crash(text: &str) {
     append_to_log(&text);
 }
 
+/// The per-process crash log path, if crash logging was installed.
+pub fn per_process_crash_log() -> Option<std::path::PathBuf> {
+    LOG.get().map(|l| l.per_process.clone())
+}
+
 fn append_to_log(text: &str) {
     use std::io::Write;
-    let Some(file) = LOG.get() else { return };
+    let Some(logs) = LOG.get() else { return };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let opened = std::fs::OpenOptions::new().create(true).append(true).open(file);
-    if let Ok(mut f) = opened {
-        let _ = write!(f, "unix time {now}, process {}\n{text}\n", std::process::id());
+    let header = format!("unix time {now}, process {}\n", std::process::id());
+    for file in [&logs.per_process, &logs.legacy] {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(file) {
+            let _ = write!(f, "{header}{text}\n");
+        }
     }
 }
 
 /// The title's last lines of debug output, kept for crash reports.
 static SAID: std::sync::Mutex<std::collections::VecDeque<String>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
-const SAID_LINES: usize = 8;
+const SAID_LINES: usize = 64;
 
 /// Keeps a line of the title's debug output for the next crash report.
 pub fn note_title_output(line: &str) {

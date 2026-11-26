@@ -3,10 +3,10 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-const MAX_FILES: usize = 12;
-const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
-const LOOKBACK: Duration = Duration::from_secs(6 * 60 * 60);
+const MAX_FILES: usize = 24;
+const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+const LOOKBACK: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// Safe remote file name and local path, newest first, within size caps.
 pub fn collect(roots: &[PathBuf], started: SystemTime) -> Vec<(String, PathBuf)> {
@@ -72,17 +72,20 @@ fn interesting_file(path: &Path) -> bool {
         return false;
     };
     let lower = name.to_ascii_lowercase();
-    if lower == "crashes.log" || lower.ends_with(".crash.log") {
+    if lower == "crashes.log"
+        || lower.ends_with(".crash.log")
+        || lower == "victory-events.jsonl"
+        || lower == "victory-runtime.log"
+    {
         return true;
     }
     if lower.ends_with(".dmp") {
         return true;
     }
-    if !(lower.ends_with(".log") || lower.ends_with(".txt")) {
+    if !(lower.ends_with(".log") || lower.ends_with(".txt") || lower.ends_with(".jsonl")) {
         return false;
     }
     lower.contains("victory")
-        || lower == "victory-runtime.log"
         || lower.contains("crash")
         || lower.contains("breakpad")
         || lower.contains("gta")

@@ -542,11 +542,13 @@ enum To {
 /// bytes), then `writes` out of it (destination, offset in it, offset in
 /// `between`, bytes). `between` is left readable as constants (and must be
 /// so, unless this is the `first` level), the others in the common state,
-/// as the submission's lists expect them.
+/// as the submission's lists expect them. `between_state` tracks `between`'s
+/// state across levels (COMMON after create / pool reuse).
 fn record(
     first: bool,
     list: &ID3D12GraphicsCommandList,
     between: &ID3D12Resource,
+    between_state: &mut D3D12_RESOURCE_STATES,
     reads: &[(&ID3D12Resource, u64, u64, u64)],
     writes: &[(&ID3D12Resource, u64, u64, u64)],
 ) {
@@ -563,12 +565,15 @@ fn record(
     }
     let both = |b: &ID3D12Resource| dests.iter().any(|d| d.as_raw() == b.as_raw());
     let constants = source | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
-    let mut barriers = vec![transition(between, dest, constants)];
-    barriers.extend(sources.iter().map(|b| transition(b, source, if both(b) { dest } else { common })));
+    let after_reads: Vec<D3D12_RESOURCE_BARRIER> = {
+        let mut barriers = vec![transition(between, dest, constants)];
+        barriers.extend(sources.iter().map(|b| transition(b, source, if both(b) { dest } else { common })));
+        barriers
+    };
     let done: Vec<D3D12_RESOURCE_BARRIER> = dests.iter().map(|b| transition(b, dest, common)).collect();
     // SAFETY: an open list; live buffers, and the callers' ranges lie in
-    // them. The buffers start in the common state (the list is the first of
-    // its call) and are promoted by their first use.
+    // them. `between` starts from the tracked state; read sources start
+    // COMMON (or after the global UAV barrier on the first level).
     unsafe {
         if first {
             // What earlier lists' shaders wrote, first.
@@ -581,19 +586,24 @@ fn record(
                     }),
                 },
             }]);
-        } else {
-            list.ResourceBarrier(&[transition(between, constants, dest)]);
         }
+        // Explicit DEST/SOURCE before any CopyBufferRegion: do not rely on
+        // COMMON promotion (INVALID_CALL under RELAY=2 + CARD_STEPS=2 when
+        // skinning UAVs race the first-level copy into `between`).
+        let mut before_reads = vec![transition(between, *between_state, dest)];
+        before_reads.extend(sources.iter().map(|b| transition(b, common, source)));
+        list.ResourceBarrier(&before_reads);
         for &(buffer, offset, at, len) in reads {
             list.CopyBufferRegion(between, at, buffer, offset, len);
         }
-        list.ResourceBarrier(&barriers);
+        list.ResourceBarrier(&after_reads);
         for &(buffer, offset, at, len) in writes {
             list.CopyBufferRegion(buffer, offset, between, at, len);
         }
         if !done.is_empty() {
             list.ResourceBarrier(&done);
         }
+        *between_state = constants;
     }
 }
 
@@ -601,6 +611,8 @@ fn record(
 struct Own {
     list: HostList,
     between: ID3D12Resource,
+    /// Tracked state of [`Self::between`] for explicit barriers in [`record`].
+    between_state: D3D12_RESOURCE_STATES,
 }
 
 // SAFETY: D3D12 objects are free-threaded, and the list is touched by one
@@ -781,7 +793,7 @@ impl Host {
             });
         }
         spent.next("steps on the card: the list");
-        let Some(own) = self.own_list() else {
+        let Some(mut own) = self.own_list() else {
             return Err("no host list or buffer for it");
         };
         // First every refresh, then the writes: the bytes compared with are
@@ -828,7 +840,7 @@ impl Host {
                     To::Slot(..) => {}
                 }
             }
-            record(level == 0, &own.list.list, &own.between, &reads, &writes);
+            record(level == 0, &own.list.list, &own.between, &mut own.between_state, &reads, &writes);
         }
         own.list.close();
         // SAFETY: a live buffer.
@@ -865,14 +877,20 @@ impl Host {
     /// A list of ours open for recording, and its buffer.
     fn own_list(&self) -> Option<Own> {
         let pooled = POOL.lock().unwrap_or_else(|e| e.into_inner()).pop();
-        if let Some(own) = pooled {
+        if let Some(mut own) = pooled {
             own.list.reset();
+            // Prior submission landed: buffer decayed to COMMON.
+            own.between_state = D3D12_RESOURCE_STATE_COMMON;
             return Some(own);
         }
         let between = self.uav_buffer(BETWEEN)?;
         name(&between, || "copies of title memory on the card".into());
         let list = self.new_list().ok()?;
-        Some(Own { list, between })
+        Some(Own {
+            list,
+            between,
+            between_state: D3D12_RESOURCE_STATE_COMMON,
+        })
     }
 }
 
@@ -1153,8 +1171,28 @@ mod tests {
         assert!(holder(&writers, 104, 120).is_err());
     }
 
+    /// `between` is tracked COMMON after create / pool reuse, then left as
+    /// constants after each [`record`] level — never relying on promotion
+    /// into COPY_DEST on the first level (INVALID_CALL under RELAY=2).
+    #[test]
+    fn between_state_is_common_then_constants_across_levels() {
+        let common = D3D12_RESOURCE_STATE_COMMON;
+        let constants =
+            D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+        let mut between_state = common;
+        // After level 0 (and every later level) record leaves constants.
+        between_state = constants;
+        assert_eq!(between_state, constants);
+        // Level 1+ still barriers from tracked constants → DEST, not COMMON.
+        assert_ne!(between_state, common);
+        between_state = constants;
+        assert_eq!(between_state, constants);
+    }
+
     /// Reads are all before writes, between two buffers and within one, and
     /// the buffers are usable in the lists that follow in the same call.
+    /// Also exercises explicit DEST/SOURCE barriers on `between` (no COMMON
+    /// promotion into the first CopyBufferRegion).
     #[test]
     fn the_card_copies_what_is_recorded() {
         let Some(host) = host() else {
@@ -1169,17 +1207,25 @@ mod tests {
             (*x, *y) = (i as u8 ^ (i >> 8) as u8, 0xee);
         }
         let was = a_bytes.to_vec();
-        let own = host.own_list().unwrap();
+        let mut own = host.own_list().unwrap();
         // Within `a` (there and back), from `a` to `b`, and a read alone.
         record(
             true,
             &own.list.list,
             &own.between,
+            &mut own.between_state,
             &[(&a, 33, 0, 100), (&a, 2000, 256, 100), (&a, 5001, 512, 7), (&a, 9, 1024, 4)],
             &[(&a, 2000, 0, 100), (&a, 33, 256, 100), (&b, 77, 512, 7)],
         );
         // A level behind it, of what it wrote.
-        record(false, &own.list.list, &own.between, &[(&b, 77, 2048, 7)], &[(&b, 1077, 2048, 7)]);
+        record(
+            false,
+            &own.list.list,
+            &own.between,
+            &mut own.between_state,
+            &[(&b, 77, 2048, 7)],
+            &[(&b, 1077, 2048, 7)],
+        );
         own.list.close();
         // A list behind it that uses the buffers in other ways.
         let next = host.new_list().unwrap();
@@ -1216,6 +1262,8 @@ mod tests {
     /// part of what the next submission's copy reads, the title wrote the
     /// rest; the copy is done on the card behind the flight, and a second
     /// one reads what the first wrote. Title memory ends as on the CPU.
+    /// With the tracked `between_state` barriers, the first-level copy must
+    /// not INVALID_CALL when skinning UAVs are still in flight (1650).
     #[test]
     #[ignore = "wants VICTORY_RELAY=2 VICTORY_CARD_STEPS=2 and a process of its own"]
     fn a_copy_behind_a_flight_reads_what_the_flight_wrote() {

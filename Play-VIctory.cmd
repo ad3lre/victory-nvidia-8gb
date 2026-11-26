@@ -49,7 +49,10 @@ if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=8"
 if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=1"
 if not defined VICTORY_LEVELS_ON_DEMAND set "VICTORY_LEVELS_ON_DEMAND=1"
 if not defined VICTORY_CARD_BUFFERS_MIN_KB set "VICTORY_CARD_BUFFERS_MIN_KB=64"
-if not defined VICTORY_LOG if not defined RUST_LOG set "VICTORY_LOG=warn"
+if not defined VICTORY_D3D12_DRED set "VICTORY_D3D12_DRED=light"
+if not defined VICTORY_D3D12_DEBUG set "VICTORY_D3D12_DEBUG=1"
+if not defined VICTORY_TRAIL set "VICTORY_TRAIL=1"
+if not defined VICTORY_LOG if not defined RUST_LOG set "VICTORY_LOG=victory_gpu=info,victory_telemetry=info,warn"
 if not defined VICTORY_CONSOLE set "VICTORY_CONSOLE=series-s"
 if /i not "%VICTORY_CONSOLE%"=="series-s" if /i not "%VICTORY_CONSOLE%"=="series-x" (
   echo Set VICTORY_CONSOLE to series-s or series-x. 1>&2

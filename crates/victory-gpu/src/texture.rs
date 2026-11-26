@@ -136,6 +136,17 @@ fn hot_textures() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HOT").is_none_or(|v| v != "0"))
 }
 
+/// Guard-path hash gate: skip reading when unwritten, not our turn, and not hot.
+/// Movie planes pass `hot = true` always so they never hit the HASH_EVERY lag.
+fn skip_unguarded_hash(exact: bool, unwritten: bool, turn: bool, hot: bool) -> bool {
+    !exact && unwritten && !turn && !hot
+}
+
+/// Partial-map throttle: non-movie streamed textures at most every 30 frames.
+fn skip_partial_map(exact: bool, movie: bool, frames_since_partial: Option<u64>) -> bool {
+    !exact && !movie && frames_since_partial.is_some_and(|age| age < 30)
+}
+
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
 unsafe impl Send for Staging {}
@@ -1470,11 +1481,15 @@ impl Staging {
                 .is_multiple_of(HASH_EVERY);
             // A texture starts hot: one written that way from its first
             // frames on changes before the hash has ever caught it.
+            // Movie planes (boot logo / character-banner video rings) stay
+            // hot always: hashing every eighth frame flashed old/new planes
+            // (fx-flicker / epilepsy banners).
             if last.hot_until == 0 {
                 last.hot_until = frame + HOT_FRAMES;
             }
-            let hot = hot_textures() && frame < last.hot_until;
-            if !exact && unwritten && !turn && !hot {
+            let movie = self.movie_plane();
+            let hot = movie || (hot_textures() && frame < last.hot_until);
+            if skip_unguarded_hash(exact, unwritten, turn, hot) {
                 return 0;
             }
             blind = unwritten;
@@ -1482,7 +1497,13 @@ impl Staging {
         // A change the guard did not see: hashed at every check for a while.
         let found_blind = |last: &mut Last| {
             if blind && hot_textures() {
-                last.hot_until = crate::frame::current() + HOT_FRAMES;
+                // Movie planes already bypass HASH_EVERY; keep them hot so a
+                // later non-movie path cannot reintroduce the 8-frame lag.
+                last.hot_until = if self.movie_plane() {
+                    u64::MAX
+                } else {
+                    crate::frame::current() + HOT_FRAMES
+                };
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHot, 1);
             }
@@ -1512,8 +1533,11 @@ impl Staging {
             // shortcut: read again at most every 30 frames (reading around
             // unmapped pages is slow, and nothing tells us when pages
             // arrive): a mip that streams in shows up to 30 frames late.
+            // Movie / banner planes skip the throttle so torn zero-rows do
+            // not linger across the boot video.
             let frame = crate::frame::current();
-            if !exact && last.partial.is_some_and(|at| frame < at + 30) {
+            let since = last.partial.map(|at| frame.saturating_sub(at));
+            if skip_partial_map(exact, self.movie_plane(), since) {
                 return 0;
             }
             last.partial = Some(frame);
@@ -2014,6 +2038,31 @@ fn uploaded_parts(
         }
     }
     parts
+}
+
+#[cfg(test)]
+mod movie_plane_gate_tests {
+    use super::{skip_partial_map, skip_unguarded_hash};
+
+    /// Movie planes stay hot: HASH_EVERY never skips them (epilepsy banners).
+    #[test]
+    fn movie_planes_bypass_hash_every_gate() {
+        let unwritten = true;
+        let turn = false; // not this plane's HASH_EVERY turn
+        assert!(skip_unguarded_hash(false, unwritten, turn, false));
+        assert!(!skip_unguarded_hash(false, unwritten, turn, true)); // movie → hot
+        assert!(!skip_unguarded_hash(true, unwritten, turn, false)); // exact
+    }
+
+    /// Movie / banner partial maps are not held for 30 frames of zeros.
+    #[test]
+    fn movie_planes_skip_partial_map_throttle() {
+        assert!(skip_partial_map(false, false, Some(0)));
+        assert!(skip_partial_map(false, false, Some(29)));
+        assert!(!skip_partial_map(false, false, Some(30)));
+        assert!(!skip_partial_map(false, true, Some(0)));
+        assert!(!skip_partial_map(true, false, Some(0)));
+    }
 }
 
 #[cfg(test)]

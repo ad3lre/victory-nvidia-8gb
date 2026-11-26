@@ -642,6 +642,39 @@ fn make_ingest_bundle(
 }
 
 #[cfg(windows)]
+fn make_ingest_bundle_with_logs(
+    id: &str,
+    machine_id: &str,
+    started: &str,
+    fork: &Json,
+    manifest: &Json,
+    samples: &[Sample],
+    partial: bool,
+    log_roots: &[std::path::PathBuf],
+) -> Json {
+    let summary = summary::compute(samples);
+    let mut fields = vec![
+        ("schema", Json::Int(1)),
+        ("run_id", Json::string(id)),
+        ("machine_id", Json::string(machine_id)),
+        ("started_at", Json::string(started)),
+        ("fork", fork.clone()),
+        ("manifest", manifest.clone()),
+        (
+            "samples",
+            Json::Arr(samples.iter().map(Sample::to_json).collect()),
+        ),
+        // Agent process: merge victory-events.jsonl the game wrote.
+        ("events", Json::Arr(events::all_with_files(log_roots))),
+        ("summary", summary.to_json()),
+    ];
+    if partial {
+        fields.push(("mode", Json::string("partial")));
+    }
+    Json::Obj(fields)
+}
+
+#[cfg(windows)]
 fn post_jpeg_ok(path: &str, jpeg: &[u8], token: &str, what: &str) -> bool {
     post_jpeg_ok_until(path, jpeg, token, what, None)
 }
@@ -911,7 +944,16 @@ fn record(options: Options, ids: RecordIds, stop: StopSource) {
         pinged = post_ok("/vi/v1/ping", &ping.to_string(), Some(tok), "ping");
         // Empty-sample ingest publishes hardware immediately and creates the
         // completed-run row the dashboard charts from.
-        let early = make_ingest_bundle(&id, &machine_id, &started, &fork, &manifest, &[], false);
+        let early = make_ingest_bundle_with_logs(
+            &id,
+            &machine_id,
+            &started,
+            &fork,
+            &manifest,
+            &[],
+            false,
+            &options.log_roots,
+        );
         ingested = ingest_ok("/vi/v1/ingest", &early.to_string(), Some(tok), "ingest-early");
     }
 
@@ -940,7 +982,7 @@ fn record(options: Options, ids: RecordIds, stop: StopSource) {
         &mut next_shot,
         &mut pending_shots,
     );
-    let mut last_log_scan = Instant::now() - Duration::from_secs(30);
+    let mut last_log_scan = Instant::now() - Duration::from_secs(5);
     let mut last_token_retry = Instant::now();
     let mut last_ingest = Instant::now();
     let mut last_ingest_len = 0usize;
@@ -959,7 +1001,16 @@ fn record(options: Options, ids: RecordIds, stop: StopSource) {
             if !ingested
                 && let Some(tok) = token.as_deref()
             {
-                let early = make_ingest_bundle(&id, &machine_id, &started, &fork, &manifest, &[], false);
+                let early = make_ingest_bundle_with_logs(
+                    &id,
+                    &machine_id,
+                    &started,
+                    &fork,
+                    &manifest,
+                    &[],
+                    false,
+                    &options.log_roots,
+                );
                 ingested = ingest_ok("/vi/v1/ingest", &early.to_string(), Some(tok), "ingest-early");
             }
         }
@@ -972,7 +1023,9 @@ fn record(options: Options, ids: RecordIds, stop: StopSource) {
             &mut next_shot,
             &mut pending_shots,
         );
-        if last_log_scan.elapsed() >= Duration::from_secs(30) {
+        // Mid-run log tails every ~5s so victory-runtime / crash / events
+        // survive a TDR that kills the game before the final flush.
+        if last_log_scan.elapsed() >= Duration::from_secs(5) {
             if let Some(tok) = token.as_deref() {
                 if !pending_shots.is_empty() {
                     flush_pending_screenshots(
@@ -994,13 +1047,13 @@ fn record(options: Options, ids: RecordIds, stop: StopSource) {
             last_log_scan = Instant::now();
         }
         // Mid-run ingest so FPS/system survive GPU TDRs that kill the process
-        // before the final flush (every ~60s once new samples exist).
-        if last_ingest.elapsed() >= Duration::from_secs(60)
+        // before the final flush (every ~30s once new samples exist).
+        if last_ingest.elapsed() >= Duration::from_secs(30)
             && samples.len() > last_ingest_len
             && let Some(tok) = token.as_deref()
         {
             let fresh = &samples[last_ingest_len..];
-            let bundle = make_ingest_bundle(
+            let bundle = make_ingest_bundle_with_logs(
                 &id,
                 &machine_id,
                 &started,
@@ -1008,6 +1061,7 @@ fn record(options: Options, ids: RecordIds, stop: StopSource) {
                 &manifest,
                 fresh,
                 true,
+                &options.log_roots,
             );
             if ingest_ok("/vi/v1/ingest", &bundle.to_string(), Some(tok), "ingest-partial") {
                 ingested = true;
@@ -1061,7 +1115,16 @@ fn record(options: Options, ids: RecordIds, stop: StopSource) {
         dir.join(format!("summary-{id}.json")),
         summary.to_json().to_string(),
     );
-    let bundle = make_ingest_bundle(&id, &machine_id, &started, &fork, &manifest, &samples, false);
+    let bundle = make_ingest_bundle_with_logs(
+        &id,
+        &machine_id,
+        &started,
+        &fork,
+        &manifest,
+        &samples,
+        false,
+        &options.log_roots,
+    );
     ensure_token(&dir, &machine_id, &mut token);
     let mut upload_notes = Vec::new();
     if let Some(tok) = token.as_deref() {
