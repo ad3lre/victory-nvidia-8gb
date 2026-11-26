@@ -2147,6 +2147,18 @@ pub(crate) fn let_go_idle() {
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
     let idle_ms = crate::host::vram_idle_override().unwrap_or(idle_ms);
+    // Boot / banner window: the pressure path's SHORT_MS drop of hundreds of
+    // title-fill copies remakes them mid-flight (device-removed). A hard hold
+    // starves new host copies (black banners, ~2 GB still without a copy on
+    // 1650). Keep a long idle and a small per-look budget so VRAM can breathe
+    // without mass remakes.
+    let (idle_ms, most) = if crate::host::intro_active() {
+        const INTRO_IDLE_MS: u64 = 60_000;
+        const INTRO_MOST: u64 = 64 << 20; // 64 MiB / look
+        (idle_ms.max(INTRO_IDLE_MS), most.min(INTRO_MOST))
+    } else {
+        (idle_ms, most)
+    };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);

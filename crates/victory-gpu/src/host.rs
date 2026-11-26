@@ -5,7 +5,7 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -2668,19 +2668,36 @@ fn late_exact() -> bool {
 /// or listed is presented the old way. Once every second and a half a
 /// submission settles the flights all the same, for the sweep that lets
 /// idle host objects go (it needs nothing in the air).
-/// Draws before which late-ahead presents stay off (boot / banner window).
-pub(crate) const LATE_PRESENT_AFTER_DRAWS: u64 = 500;
+/// Draws/frame at which the boot / banner window ends (banners sit ~8–10;
+/// the world jumps well above this). Sticky once crossed.
+pub(crate) const INTRO_DRAWS_PER_FRAME: f64 = 64.0;
 
-/// Whether late-ahead present is allowed for the current draw count / late stage.
-fn late_free_present_at(late: u8, drawn: u64) -> bool {
-    late > 2 && drawn >= LATE_PRESENT_AFTER_DRAWS
+/// Left once any frame line reports draws/frame ≥ [`INTRO_DRAWS_PER_FRAME`].
+static INTRO_LEFT: AtomicBool = AtomicBool::new(false);
+
+/// Record per-frame draws from the frame-rate line; leave intro when the
+/// world draw rate appears.
+pub(crate) fn note_frame_draws(draws_per_frame: f64) {
+    if draws_per_frame >= INTRO_DRAWS_PER_FRAME {
+        INTRO_LEFT.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Boot / character-banner window: low draws/frame until the world starts.
+pub(crate) fn intro_active() -> bool {
+    !INTRO_LEFT.load(Ordering::Relaxed)
+}
+
+/// Whether late-ahead present is allowed for the current late stage / intro.
+fn late_free_present_at(late: u8, intro_done: bool) -> bool {
+    late > 2 && intro_done
 }
 
 pub(crate) fn late_free_present() -> bool {
     // Boot / character-banner window: settle the present copy so two-plane
     // banner frames cannot race in-flight uploads (epilepsy + device-removed
-    // on 1650). Late-ahead slots only after [`LATE_PRESENT_AFTER_DRAWS`].
-    late_free_present_at(late_stage(), crate::draw::drawn())
+    // on 1650). Late-ahead slots only after [`intro_active`] ends.
+    late_free_present_at(late_stage(), !intro_active())
 }
 
 /// The relay's first stage (`VICTORY_RELAY=1`; off by default; it turns
@@ -2806,15 +2823,14 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{LATE_PRESENT_AFTER_DRAWS, flagged_pieces, landable, late_free_present_at};
+    use super::{flagged_pieces, landable, late_free_present_at};
 
-    /// Boot / banner draws keep presents settled; late-ahead only after.
+    /// Boot / banner draws keep presents settled; late-ahead only after intro.
     #[test]
     fn late_free_present_waits_out_the_banner_window() {
-        assert!(!late_free_present_at(3, 0));
-        assert!(!late_free_present_at(3, LATE_PRESENT_AFTER_DRAWS - 1));
-        assert!(late_free_present_at(3, LATE_PRESENT_AFTER_DRAWS));
-        assert!(!late_free_present_at(2, LATE_PRESENT_AFTER_DRAWS));
+        assert!(!late_free_present_at(3, false));
+        assert!(late_free_present_at(3, true));
+        assert!(!late_free_present_at(2, true));
     }
 
     /// Two flights and what follows each: nothing of the second lands
@@ -9101,6 +9117,7 @@ impl Meter {
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         memory_benchmark_line(fps, ms);
         let draws = (drawn - self.drawn) as f64 / frames;
+        note_frame_draws(draws);
         crate::overlay::set_frame(fps, ms, draws);
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.

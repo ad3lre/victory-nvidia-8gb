@@ -4289,6 +4289,16 @@ fn make_twinned(
                 {
                     from_base(desc, copy.base);
                 }
+                // Host copies can be shorter than the title's mip chain
+                // (DROP_MIPS, held_only base, levels-on-demand). Clamp the
+                // view so CreateShaderResourceView cannot ask past the last
+                // host mip (1650: MostDetailedMip=3 MipLevels=5 on 6 levels
+                // → device-removed 0x887A0001).
+                if let Some(desc) = &mut desc {
+                    // SAFETY: live texture.
+                    let host_mips = u32::from(unsafe { texture.GetDesc() }.MipLevels).max(1);
+                    clamp_srv_to_host_mips(desc, host_mips);
+                }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(
@@ -4433,17 +4443,127 @@ fn make_twinned(
 /// on (`crate::resource::held_only`). What it shows of larger ones, if any,
 /// is left out.
 fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32) {
-    if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D {
-        return;
+    let shift = |most: &mut u32, mips: &mut u32, min_lod: &mut f32| {
+        let lost = base.saturating_sub(*most);
+        *most = most.saturating_sub(base);
+        if *mips != u32::MAX {
+            *mips = mips.saturating_sub(lost).max(1);
+        }
+        *min_lod = (*min_lod - base as f32).max(0.0);
+    };
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.Texture2D };
+            shift(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.Texture2DArray };
+            shift(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        _ => {}
     }
-    // SAFETY: the member its dimension says.
-    let t = unsafe { &mut desc.Anonymous.Texture2D };
-    let lost = base.saturating_sub(t.MostDetailedMip);
-    t.MostDetailedMip = t.MostDetailedMip.saturating_sub(base);
-    if t.MipLevels != u32::MAX {
-        t.MipLevels = t.MipLevels.saturating_sub(lost).max(1);
+}
+
+/// Clamps a shader view's mip window to a host texture of `host_mips` levels.
+fn clamp_srv_to_host_mips(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, host_mips: u32) {
+    let host_mips = host_mips.max(1);
+    let clamp = |most: &mut u32, mips: &mut u32| {
+        if *most >= host_mips {
+            *most = host_mips - 1;
+            *mips = 1;
+            return;
+        }
+        let remain = host_mips - *most;
+        if *mips == u32::MAX {
+            // all remaining levels — valid as-is
+        } else if *mips == 0 || *mips > remain {
+            *mips = remain;
+        }
+    };
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.Texture2D };
+            clamp(&mut t.MostDetailedMip, &mut t.MipLevels);
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.Texture2DArray };
+            clamp(&mut t.MostDetailedMip, &mut t.MipLevels);
+        }
+        D3D12_SRV_DIMENSION_TEXTURE3D => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.Texture3D };
+            clamp(&mut t.MostDetailedMip, &mut t.MipLevels);
+        }
+        D3D12_SRV_DIMENSION_TEXTURE1D => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.Texture1D };
+            clamp(&mut t.MostDetailedMip, &mut t.MipLevels);
+        }
+        D3D12_SRV_DIMENSION_TEXTURE1DARRAY => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.Texture1DArray };
+            clamp(&mut t.MostDetailedMip, &mut t.MipLevels);
+        }
+        _ => {}
     }
-    t.ResourceMinLODClamp = (t.ResourceMinLODClamp - base as f32).max(0.0);
+}
+
+#[cfg(test)]
+mod srv_mip_clamp_tests {
+    use super::{clamp_srv_to_host_mips, from_base};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    #[test]
+    fn clamp_cuts_mip_window_that_runs_past_host() {
+        let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: 5768,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 3,
+                    MipLevels: 5,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        clamp_srv_to_host_mips(&mut desc, 6);
+        // SAFETY: TEXTURE2D.
+        let t = unsafe { desc.Anonymous.Texture2D };
+        assert_eq!(t.MostDetailedMip, 3);
+        assert_eq!(t.MipLevels, 3);
+    }
+
+    #[test]
+    fn from_base_shifts_2d_array_views() {
+        let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Shader4ComponentMapping: 5768,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MostDetailedMip: 3,
+                    MipLevels: 5,
+                    FirstArraySlice: 0,
+                    ArraySize: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 3.0,
+                },
+            },
+        };
+        from_base(&mut desc, 2);
+        // SAFETY: TEXTURE2DARRAY.
+        let t = unsafe { desc.Anonymous.Texture2DArray };
+        assert_eq!(t.MostDetailedMip, 1);
+        assert_eq!(t.MipLevels, 5);
+        assert_eq!(t.ResourceMinLODClamp, 1.0);
+    }
 }
 
 /// Writes of a slot with another view of the placed texture it showed,

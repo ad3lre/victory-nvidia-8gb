@@ -3,9 +3,31 @@ use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 
 const AGILITY_VERSION: &str = "1.620.2";
-const AGILITY_URL: &str = "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.d3d12/1.620.2/microsoft.direct3d.d3d12.1.620.2.nupkg";
-const AGILITY_MEMBER: &str = "build/native/bin/x64/D3D12Core.dll";
-const AGILITY_SHA256: &str = "70a6d47d335b4a15180544c01a35b84474522a369dc582d85fe057313a3aeaa0";
+const AGILITY_URL: &str =
+    "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.d3d12/1.620.2/microsoft.direct3d.d3d12.1.620.2.nupkg";
+
+struct AgilityDll {
+    /// Path inside the nupkg.
+    member: &'static str,
+    /// File name under `.\D3D12\` next to the exe.
+    file: &'static str,
+    sha256: &'static str,
+}
+
+const AGILITY_DLLS: &[AgilityDll] = &[
+    AgilityDll {
+        member: "build/native/bin/x64/D3D12Core.dll",
+        file: "D3D12Core.dll",
+        sha256: "70a6d47d335b4a15180544c01a35b84474522a369dc582d85fe057313a3aeaa0",
+    },
+    // Matching SDK layers: without this, VICTORY_D3D12_DEBUG fails with
+    // 0x887A002D (SDK component missing) when Agility Core is loaded.
+    AgilityDll {
+        member: "build/native/bin/x64/d3d12SDKLayers.dll",
+        file: "d3d12SDKLayers.dll",
+        sha256: "3140822f550003d322b0a0681e0c40af7364c561296a1d7eeb96b3258c9cd32d",
+    },
+];
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -14,41 +36,54 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         println!("cargo:rustc-link-arg-bins=/EXPORT:D3D12SDKVersion,DATA");
         println!("cargo:rustc-link-arg-bins=/EXPORT:D3D12SDKPath,DATA");
-        match ensure_agility_core() {
-            Ok(path) => println!(
+        match ensure_agility() {
+            Ok(dir) => println!(
                 "cargo:warning=Agility SDK {AGILITY_VERSION} ready at {}",
-                path.display()
+                dir.display()
             ),
             Err(error) => {
                 println!(
-                    "cargo:warning=Agility SDK {AGILITY_VERSION} D3D12Core.dll not installed: {error}"
+                    "cargo:warning=Agility SDK {AGILITY_VERSION} not fully installed: {error}"
                 );
                 println!(
-                    "cargo:warning=Device creation may fail with 0x887E0003 until D3D12\\D3D12Core.dll sits next to victory.exe"
+                    "cargo:warning=Device creation may fail with 0x887E0003 until D3D12\\D3D12Core.dll sits next to victory.exe; debug layer needs d3d12SDKLayers.dll too"
                 );
             }
         }
     }
 }
 
-fn ensure_agility_core() -> io::Result<PathBuf> {
+fn ensure_agility() -> io::Result<PathBuf> {
     let dest_dir = exe_dir()?.join("D3D12");
-    let dest = dest_dir.join("D3D12Core.dll");
-    if dll_ok(&dest)? {
-        return Ok(dest);
+    let missing: Vec<&AgilityDll> = AGILITY_DLLS
+        .iter()
+        .filter(|dll| !dll_ok(&dest_dir.join(dll.file), dll.sha256).unwrap_or(false))
+        .collect();
+    if missing.is_empty() {
+        return Ok(dest_dir.join(AGILITY_DLLS[0].file));
     }
     if std::env::var_os("VICTORY_SKIP_AGILITY_FETCH").is_some() {
         return Err(io::Error::other(
-            "VICTORY_SKIP_AGILITY_FETCH is set and D3D12Core.dll is missing",
+            "VICTORY_SKIP_AGILITY_FETCH is set and Agility DLLs are missing",
         ));
     }
     fs::create_dir_all(&dest_dir)?;
-    let bytes = download_agility_dll()?;
-    verify_sha256(&bytes, AGILITY_SHA256)?;
-    let tmp = dest.with_extension("dll.part");
-    fs::write(&tmp, &bytes)?;
-    fs::rename(&tmp, &dest)?;
-    Ok(dest)
+    let nupkg = download_agility_nupkg()?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(nupkg))
+        .map_err(|error| io::Error::other(format!("open nupkg: {error}")))?;
+    for dll in missing {
+        let mut entry = archive.by_name(dll.member).map_err(|error| {
+            io::Error::other(format!("nupkg missing {}: {error}", dll.member))
+        })?;
+        let mut bytes = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut bytes)?;
+        verify_sha256(&bytes, dll.sha256, dll.file)?;
+        let dest = dest_dir.join(dll.file);
+        let tmp = dest.with_extension("dll.part");
+        fs::write(&tmp, &bytes)?;
+        fs::rename(&tmp, &dest)?;
+    }
+    Ok(dest_dir.join(AGILITY_DLLS[0].file))
 }
 
 fn exe_dir() -> io::Result<PathBuf> {
@@ -61,19 +96,19 @@ fn exe_dir() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::other("cannot locate target profile directory from OUT_DIR"))
 }
 
-fn dll_ok(path: &Path) -> io::Result<bool> {
+fn dll_ok(path: &Path, sha256: &str) -> io::Result<bool> {
     if !path.is_file() {
         return Ok(false);
     }
     let bytes = fs::read(path)?;
-    Ok(verify_sha256(&bytes, AGILITY_SHA256).is_ok())
+    Ok(verify_sha256(&bytes, sha256, path.display().to_string().as_str()).is_ok())
 }
 
-fn download_agility_dll() -> io::Result<Vec<u8>> {
+fn download_agility_nupkg() -> io::Result<Vec<u8>> {
     const ATTEMPTS: u32 = 3;
     let mut last = None;
     for attempt in 1..=ATTEMPTS {
-        match download_agility_dll_once() {
+        match download_agility_nupkg_once() {
             Ok(bytes) => return Ok(bytes),
             Err(error) => {
                 last = Some(error);
@@ -86,9 +121,9 @@ fn download_agility_dll() -> io::Result<Vec<u8>> {
     Err(last.unwrap_or_else(|| io::Error::other("Agility download failed")))
 }
 
-fn download_agility_dll_once() -> io::Result<Vec<u8>> {
+fn download_agility_nupkg_once() -> io::Result<Vec<u8>> {
     let response = ureq::get(AGILITY_URL)
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(60))
         .call()
         .map_err(|error| io::Error::other(format!("download {AGILITY_URL}: {error}")))?;
     let mut nupkg = Vec::new();
@@ -96,23 +131,16 @@ fn download_agility_dll_once() -> io::Result<Vec<u8>> {
         .into_reader()
         .take(64 * 1024 * 1024)
         .read_to_end(&mut nupkg)?;
-    let mut archive = zip::ZipArchive::new(Cursor::new(nupkg))
-        .map_err(|error| io::Error::other(format!("open nupkg: {error}")))?;
-    let mut entry = archive
-        .by_name(AGILITY_MEMBER)
-        .map_err(|error| io::Error::other(format!("nupkg missing {AGILITY_MEMBER}: {error}")))?;
-    let mut dll = Vec::with_capacity(entry.size() as usize);
-    entry.read_to_end(&mut dll)?;
-    Ok(dll)
+    Ok(nupkg)
 }
 
-fn verify_sha256(bytes: &[u8], expect_hex: &str) -> io::Result<()> {
+fn verify_sha256(bytes: &[u8], expect_hex: &str, label: &str) -> io::Result<()> {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(bytes);
     let actual = hex_lower(&digest);
     if actual != expect_hex {
         return Err(io::Error::other(format!(
-            "D3D12Core.dll sha256 mismatch: got {actual}, expected {expect_hex}"
+            "{label} sha256 mismatch: got {actual}, expected {expect_hex}"
         )));
     }
     Ok(())
