@@ -148,7 +148,7 @@ export function AdvancedSettings({
               commit(next);
             }}
           />
-          Also prebuild host pipelines (slow, GPU/driver specific)
+          Prebuild host pipelines on first Play (avoids cold-boot hang; GPU-specific)
         </label>
       </div>
 

@@ -231,41 +231,53 @@ pub fn warm_shaders(
     let fp = warm_state::fingerprint(&build, &warm_env, &ids);
     let marker = warm_state::marker_path(&cache);
     let current = warm_state::read_marker(&marker);
-    if !warm_state::needs_warm(always, current.as_deref(), &fp) {
+    let shaders_stale = warm_state::needs_warm(always, current.as_deref(), &fp);
+    // Sibling of the shader cache folder (`…/shaders` → `…/pipelines`).
+    let library = warm_state::pipeline_library_path(&cache);
+    let need_pipelines = warm_state::need_pipeline_warm(pipelines, always, &library);
+    if !shaders_stale && !need_pipelines {
         stage(app, job, "Shader cache already warm — skipping");
         push_log(app, job, format!("warm marker ok ({fp})"));
         return Ok(());
     }
 
-    stage(
-        app,
-        job,
-        "Warming shaders (first time takes several minutes — later launches skip this)",
-    );
     let dir = repo_dir(&p.repo);
-    let mut c = Command::new(&exe);
-    c.arg("shaders");
-    for a in &archives {
-        c.arg(a);
+    if shaders_stale {
+        stage(
+            app,
+            job,
+            "Warming shaders (first time takes several minutes — later launches skip this)",
+        );
+        let mut c = Command::new(&exe);
+        c.arg("shaders");
+        for a in &archives {
+            c.arg(a);
+        }
+        for (k, v) in detect_launch_env(&dir) {
+            c.env(&k, &v);
+        }
+        for (k, v) in &warm_env {
+            c.env(k, v);
+        }
+        push_log(
+            app,
+            job,
+            format!(
+                "victory shaders ({} archives) → {}",
+                archives.len(),
+                cache.display()
+            ),
+        );
+        run_cmd(app, job, &mut c)?;
+    } else {
+        push_log(
+            app,
+            job,
+            format!("warm marker ok ({fp}); shaders skipped, host pipelines still needed"),
+        );
     }
-    for (k, v) in detect_launch_env(&dir) {
-        c.env(&k, &v);
-    }
-    for (k, v) in &warm_env {
-        c.env(k, v);
-    }
-    push_log(
-        app,
-        job,
-        format!(
-            "victory shaders ({} archives) → {}",
-            archives.len(),
-            cache.display()
-        ),
-    );
-    run_cmd(app, job, &mut c)?;
 
-    if pipelines {
+    if need_pipelines {
         stage(app, job, "Prebuilding host pipelines (GPU-specific, slow)");
         let shaders = game_dir.join("shaders.rpf");
         let dlls = [
@@ -303,9 +315,11 @@ pub fn warm_shaders(
         }
     }
 
-    warm_state::write_marker(&marker, &fp)
-        .map_err(|e| format!("could not write warm marker: {e}"))?;
-    push_log(app, job, format!("warm marker written ({fp})"));
+    if shaders_stale {
+        warm_state::write_marker(&marker, &fp)
+            .map_err(|e| format!("could not write warm marker: {e}"))?;
+        push_log(app, job, format!("warm marker written ({fp})"));
+    }
     stage(app, job, "Shaders warmed — ready to play");
     Ok(())
 }

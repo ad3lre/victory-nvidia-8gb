@@ -82,6 +82,17 @@ pub fn needs_warm(always: bool, marker: Option<&str>, fingerprint: &str) -> bool
     always || marker.map(str::trim) != Some(fingerprint)
 }
 
+/// Whether `victory translate --pipelines` should run: opted in, and either
+/// forced or `host-pipelines.bin` is still missing (cold first Play).
+pub fn need_pipeline_warm(pipelines: bool, always: bool, library: &Path) -> bool {
+    pipelines && (always || !library.is_file())
+}
+
+/// Path of the host pipeline library under a Victory cache root.
+pub fn pipeline_library_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("pipelines").join("host-pipelines.bin")
+}
+
 pub fn read_marker(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
@@ -114,4 +125,29 @@ pub fn warm_archives(game_dir: &Path) -> Result<Vec<PathBuf>, String> {
     }
     archives.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
     Ok(archives)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn pipeline_warm_when_library_missing_even_if_shaders_are_warm() {
+        let dir = std::env::temp_dir().join(format!(
+            "ad3lhub-warm-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let library = pipeline_library_path(&dir);
+        assert!(!library.is_file());
+        assert!(need_pipeline_warm(true, false, &library));
+        assert!(!need_pipeline_warm(false, false, &library));
+        fs::create_dir_all(library.parent().unwrap()).unwrap();
+        fs::write(&library, b"x").unwrap();
+        assert!(!need_pipeline_warm(true, false, &library));
+        assert!(need_pipeline_warm(true, true, &library));
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
