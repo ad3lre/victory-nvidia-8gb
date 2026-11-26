@@ -145,7 +145,7 @@ impl Settings {
 }
 
 struct AppState {
-    settings: Mutex<Settings>,
+    settings: Arc<Mutex<Settings>>,
     settings_path: PathBuf,
     job: SharedJob,
     repos: Arc<Mutex<HashMap<String, RepoState>>>,
@@ -296,6 +296,15 @@ fn repo_statuses(state: State<'_, AppState>) -> HashMap<String, RepoState> {
     state.repos.lock().clone()
 }
 
+fn same_commit(a: &str, b: &str) -> bool {
+    let a = a.trim().to_ascii_lowercase();
+    let b = b.trim().to_ascii_lowercase();
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    a == b || a.starts_with(&b) || b.starts_with(&a)
+}
+
 #[tauri::command]
 fn update_available(state: State<'_, AppState>, project: Project) -> Option<String> {
     if project.local_exe.is_some() {
@@ -307,21 +316,31 @@ fn update_available(state: State<'_, AppState>, project: Project) -> Option<Stri
             return None;
         }
     }
-    let remote = state.repos.lock().get(&project.repo)?.remote.clone()?;
     if !paths::built_exe(&project.repo).is_file() {
         return None;
     }
+    // Prefer freshly resolved remote tip over a stale cache entry.
+    let remote = catalog::remote_head(&project).or_else(|| {
+        state
+            .repos
+            .lock()
+            .get(&project.repo)
+            .and_then(|r| r.remote.clone())
+    })?;
     let built = std::fs::read_to_string(paths::built_file(&project.repo))
         .ok()
-        .map(|s| s.trim().to_string());
-    let newer = built.as_deref() != Some(remote.as_str());
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    if same_commit(&built, &remote) {
+        return None;
+    }
     let later = state
         .settings
         .lock()
         .later
         .iter()
-        .any(|(r, c)| r == &project.repo && c == &remote);
-    (newer && !later).then_some(remote)
+        .any(|(r, c)| r == &project.repo && same_commit(c, &remote));
+    (!later).then_some(remote)
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -356,7 +375,8 @@ fn start_job(
     let _ = app.emit("job", &state.job.lock().snapshot());
 
     let job = state.job.clone();
-    let settings = state.settings.lock().clone();
+    let settings_live = state.settings.clone();
+    let settings_snap = state.settings.lock().clone();
     let repos = state.repos.clone();
     let settings_path = state.settings_path.clone();
 
@@ -368,6 +388,12 @@ fn start_job(
                 let updating = paths::built_exe(&p.repo).is_file();
                 let r = install(&app, &job, p);
                 if r.is_ok() {
+                    // Drop deferred "Later" for this repo — tip is installed now.
+                    {
+                        let mut s = settings_live.lock();
+                        s.later.retain(|(repo, _)| repo != &p.repo);
+                        let _ = save_settings(&settings_path, &s);
+                    }
                     let mut j = job.lock();
                     j.stage = if updating {
                         "Updated: ready to play".into()
@@ -380,32 +406,32 @@ fn start_job(
             JobKind::Uninstall => uninstall(&app, &job, project.as_ref().expect("project")),
             JobKind::WarmShaders => {
                 let p = project.as_ref().expect("project");
-                let plan = settings.launch_plan();
+                let plan = settings_snap.launch_plan();
                 let env = resolve_env(&plan);
                 warm_shaders(
                     &app,
                     &job,
                     p,
-                    &PathBuf::from(&settings.game_dir),
+                    &PathBuf::from(&settings_snap.game_dir),
                     &env,
-                    settings.always_rewarm,
-                    settings.warm_pipelines,
+                    settings_snap.always_rewarm,
+                    settings_snap.warm_pipelines,
                 )
             }
             JobKind::Play => {
                 let p = project.as_ref().expect("project");
-                let plan = settings.launch_plan();
+                let plan = settings_snap.launch_plan();
                 let env = resolve_env(&plan);
                 play(
                     &app,
                     &job,
                     p,
-                    &PathBuf::from(&settings.game_dir),
+                    &PathBuf::from(&settings_snap.game_dir),
                     &env,
                     plan.fullscreen_hook,
-                    settings.warm_before_play,
-                    settings.always_rewarm,
-                    settings.warm_pipelines,
+                    settings_snap.warm_before_play,
+                    settings_snap.always_rewarm,
+                    settings_snap.warm_pipelines,
                 )
             }
         };
@@ -436,15 +462,16 @@ fn start_job(
                 }
             }
         }
-        let _ = app.emit("job", &job.lock().snapshot());
+        let snap = job.lock().snapshot();
+        let _ = app.emit("job", &snap);
 
-        if let Some(p) = project {
+        if let Some(p) = &project {
             if !matches!(kind, JobKind::Play | JobKind::WarmShaders) {
-                let st = repo_state(&p);
-                repos.lock().insert(p.repo.clone(), st);
+                let st = repo_state(p);
+                repos.lock().insert(p.repo.clone(), st.clone());
+                let _ = app.emit("repo", &(p.repo.clone(), st));
             }
         }
-        let _ = settings_path;
     });
 
     Ok(())
@@ -570,7 +597,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .manage(AppState {
-            settings: Mutex::new(settings),
+            settings: Arc::new(Mutex::new(settings)),
             settings_path,
             job: Arc::new(Mutex::new(jobs::Job::default())),
             repos: Arc::new(Mutex::new(HashMap::new())),

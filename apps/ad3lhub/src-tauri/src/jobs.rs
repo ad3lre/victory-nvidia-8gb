@@ -113,6 +113,23 @@ fn run_with(
     }
 }
 
+fn git_head(dir: &Path) -> Result<String, String> {
+    let mut c = tools::git();
+    c.args(["rev-parse", "HEAD"]).current_dir(dir);
+    hide_window(&mut c);
+    let out = c
+        .output()
+        .map_err(|e| format!("git rev-parse HEAD failed: {e}"))?;
+    if !out.status.success() {
+        return Err("git rev-parse HEAD failed".into());
+    }
+    let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if hash.len() < 7 {
+        return Err(format!("unexpected HEAD hash: {hash}"));
+    }
+    Ok(hash)
+}
+
 pub fn install(app: &AppHandle, job: &SharedJob, p: &Project) -> Result<(), String> {
     let ws = workspace();
     std::fs::create_dir_all(ws.join("repos"))
@@ -121,21 +138,50 @@ pub fn install(app: &AppHandle, job: &SharedJob, p: &Project) -> Result<(), Stri
     let url = format!("https://github.com/{}.git", p.repo);
     if dir.join(".git").is_dir() {
         stage(app, job, "Downloading the new version");
-        let refspec = p.branch.clone().unwrap_or_else(|| "HEAD".into());
-        run_cmd(
-            app,
-            job,
-            tools::git()
-                .args(["fetch", "--depth", "1", "origin", &refspec])
-                .current_dir(&dir),
-        )?;
-        run_cmd(
-            app,
-            job,
-            tools::git()
-                .args(["reset", "--hard", "FETCH_HEAD"])
-                .current_dir(&dir),
-        )?;
+        match &p.branch {
+            Some(b) => {
+                let dst = format!("refs/remotes/origin/{b}");
+                run_cmd(
+                    app,
+                    job,
+                    tools::git()
+                        .args([
+                            "fetch",
+                            "--depth",
+                            "1",
+                            "origin",
+                            &format!("+refs/heads/{b}:{dst}"),
+                        ])
+                        .current_dir(&dir),
+                )?;
+                run_cmd(
+                    app,
+                    job,
+                    tools::git()
+                        .args(["checkout", "-B", b, &format!("origin/{b}")])
+                        .current_dir(&dir),
+                )?;
+            }
+            None => {
+                // Pin to the same OID `ls-remote HEAD` reports so update checks stay in sync.
+                let tip = crate::catalog::remote_head(p)
+                    .ok_or_else(|| "could not resolve remote HEAD".to_string())?;
+                run_cmd(
+                    app,
+                    job,
+                    tools::git()
+                        .args(["fetch", "--depth", "1", "origin", &tip])
+                        .current_dir(&dir),
+                )?;
+                run_cmd(
+                    app,
+                    job,
+                    tools::git()
+                        .args(["reset", "--hard", "FETCH_HEAD"])
+                        .current_dir(&dir),
+                )?;
+            }
+        }
     } else {
         stage(app, job, "Downloading the project");
         let mut c = tools::git();
@@ -164,15 +210,13 @@ pub fn install(app: &AppHandle, job: &SharedJob, p: &Project) -> Result<(), Stri
             built_exe(&p.repo).display()
         ));
     }
-    let mut c = tools::git();
-    c.args(["rev-parse", "HEAD"]).current_dir(&dir);
-    hide_window(&mut c);
-    if let Ok(out) = c.output() {
-        let _ = std::fs::write(
-            built_file(&p.repo),
-            String::from_utf8_lossy(&out.stdout).trim(),
-        );
-    }
+    // Record the commit we actually built — must succeed or update checks stay wrong forever.
+    let recorded = git_head(&dir)?;
+    std::fs::create_dir_all(target_dir(&p.repo))
+        .map_err(|e| format!("cannot write build marker dir: {e}"))?;
+    std::fs::write(built_file(&p.repo), &recorded)
+        .map_err(|e| format!("could not write built-from.txt: {e}"))?;
+    push_log(app, job, format!("built from {recorded}"));
     Ok(())
 }
 

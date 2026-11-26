@@ -111,14 +111,37 @@ export default function App() {
         setFlagCatalog(await invoke<FlagCatalog>("flag_catalog"));
         await Promise.all([refreshCatalog(), refreshFiles(), refreshTools(), refreshPreview()]);
         setJob(await invoke<JobSnapshot>("get_job"));
-        const u1 = await listen<JobSnapshot>("job", (e) => setJob(e.payload));
+        const u1 = await listen<JobSnapshot>("job", (e) => {
+          const next = e.payload;
+          setJob((prev) => {
+            // After install/update finishes, re-probe so the toast clears.
+            if (prev.running && !next.running && !next.failed && next.repo) {
+              const repo = next.repo;
+              void refreshCatalog().then((c) => {
+                const all = [c.featured, ...c.community];
+                const hit = all.find((p) => p.repo === repo);
+                if (hit) void checkProject(hit);
+              });
+            }
+            return next;
+          });
+        });
         const u2 = await listen("auto-check", () => {
           void refreshCatalog().then((c) => {
             const all = [c.featured, ...c.community];
             for (const p of all) void checkProject(p);
           });
         });
-        unsubs = [u1, u2];
+        const u3 = await listen<[string, RepoState]>("repo", (e) => {
+          const [repo, st] = e.payload;
+          setStatuses((prev) => ({ ...prev, [repo]: st }));
+          void refreshCatalog().then((c) => {
+            const all = [c.featured, ...c.community];
+            const hit = all.find((p) => p.repo === repo);
+            if (hit) void checkProject(hit);
+          });
+        });
+        unsubs = [u1, u2, u3];
         setReady(true);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
