@@ -10,7 +10,8 @@ No game files are included or downloaded. You need your own copy of the game.
 - Live PortWatch project list, custom GitHub links
 - Install / update / uninstall (repos, build targets, shader cache; saves kept)
 - Game-folder check, drive search, install-folder move
-- Series S, 8 GB fix, bright shadows, borderless fullscreen, extra `VICTORY_*` env
+- Launch presets (Ad3l balanced, pareto, Series S low-memory, NVIDIA 8 GB) plus curated `VICTORY_*` flags for display, memory, performance, lighting, and diagnostics — more than Mandyhub’s few toggles
+- Freeform env overrides and an effective-environment preview for power users
 - Detect Git / Rust / MSVC; install missing tools with winget
 - Update checks on start and every 15 minutes
 

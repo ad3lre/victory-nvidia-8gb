@@ -200,9 +200,7 @@ pub fn play(
     job: &SharedJob,
     p: &Project,
     game_dir: &Path,
-    series_s: bool,
-    scale: f32,
-    extra: &str,
+    env: &std::collections::BTreeMap<String, String>,
     fullscreen: bool,
 ) -> Result<(), String> {
     let exe = p
@@ -218,26 +216,26 @@ pub fn play(
     let mut c = Command::new(&exe);
     c.arg("run").arg(game_dir.join(EXE_NAME)).arg("--execute");
     let dir = repo_dir(&p.repo);
+    // Project play.ps1 first; Ad3lHub resolved flags override afterward.
     for (k, v) in detect_launch_env(&dir) {
         c.env(&k, &v);
     }
-    if series_s {
-        c.args(["--console", "series-s"]);
-        c.env("VICTORY_OWN_UPSCALER", "1");
-        c.env("VICTORY_RENDER_SCALE", format!("{scale:.2}"));
+    let console = env
+        .get("VICTORY_CONSOLE")
+        .map(String::as_str)
+        .unwrap_or("series-s");
+    if console.eq_ignore_ascii_case("series-s") || console.eq_ignore_ascii_case("series-x") {
+        c.args(["--console", console]);
+    }
+    push_log(app, job, format!("== Ad3lHub flags ({})", env.len()));
+    for (k, v) in env {
+        c.env(k, v);
+        push_log(app, job, format!("{k}={v}"));
     }
     let data = ws.join("data").join(slug(&p.repo));
     let _ = std::fs::create_dir_all(&data);
     c.env("VICTORY_DATA_DIR", &data);
     c.env("VICTORY_CACHE_DIR", ws.join("cache").join(slug(&p.repo)));
-    for line in extra.lines() {
-        if let Some((k, v)) = line.split_once('=') {
-            let k = k.trim();
-            if k.starts_with("VICTORY_") {
-                c.env(k, v.trim());
-            }
-        }
-    }
     run_with(app, job, &mut c, |pid| {
         if fullscreen {
             fullscreen::keep_borderless(pid);
