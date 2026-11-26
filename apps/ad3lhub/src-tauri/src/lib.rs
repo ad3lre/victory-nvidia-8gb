@@ -1,4 +1,5 @@
 mod catalog;
+mod flags;
 mod fullscreen;
 mod jobs;
 mod paths;
@@ -6,6 +7,7 @@ mod process_util;
 mod tools;
 
 use catalog::{featured_project, fetch_portwatch, parse_repo, repo_state, Project, RepoState};
+use flags::{preset_flags, resolve_env, FlagCatalog, LaunchPlan};
 use jobs::{install, install_tools, play, uninstall, JobSnapshot, SharedJob};
 use parking_lot::Mutex;
 use paths::{
@@ -13,16 +15,18 @@ use paths::{
     set_install_dir, workspace, PROJECT_PARTS, REQUIRED,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     pub game_dir: String,
+    #[serde(default)]
     pub fix_8gb: bool,
+    #[serde(default)]
     pub bright_shadows: bool,
     pub defaults_set: bool,
     pub fullscreen: bool,
@@ -30,10 +34,49 @@ pub struct Settings {
     pub later: Vec<(String, String)>,
     pub selected: Option<String>,
     pub custom: Vec<Project>,
+    #[serde(default)]
     pub series_s: bool,
+    #[serde(default = "default_scale")]
     pub render_scale: f32,
     pub extra_env: String,
     pub gpu_filter: usize,
+    #[serde(default = "default_preset")]
+    pub preset: String,
+    #[serde(default)]
+    pub flags: BTreeMap<String, String>,
+    #[serde(default)]
+    pub show_expert: bool,
+}
+
+fn default_preset() -> String {
+    "ad3l-balanced".into()
+}
+
+fn default_scale() -> f32 {
+    0.5
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            game_dir: String::new(),
+            fix_8gb: true,
+            bright_shadows: true,
+            defaults_set: false,
+            fullscreen: false,
+            install_dir: String::new(),
+            later: Vec::new(),
+            selected: None,
+            custom: Vec::new(),
+            series_s: true,
+            render_scale: 0.5,
+            extra_env: String::new(),
+            gpu_filter: 0,
+            preset: default_preset(),
+            flags: BTreeMap::new(),
+            show_expert: false,
+        }
+    }
 }
 
 impl Settings {
@@ -41,14 +84,45 @@ impl Settings {
         if self.render_scale <= 0.0 {
             self.render_scale = 0.5;
         }
+        if self.preset.is_empty() {
+            self.preset = default_preset();
+        }
         if !self.defaults_set {
             self.defaults_set = true;
             self.fix_8gb = true;
             self.bright_shadows = true;
             self.series_s = true;
             self.render_scale = 0.5;
+            self.preset = default_preset();
+            self.flags = preset_flags("ad3l-balanced");
+            // Mirror legacy Mandyhub toggles into the flag map once.
+            if self.fix_8gb {
+                self.flags
+                    .insert("TEXTURE_DROP_MIPS".into(), "2".into());
+                self.flags.insert("NULL_COLOR".into(), "grey".into());
+            }
+            if self.bright_shadows {
+                self.flags.insert("AMBIENT".into(), "0.6".into());
+            }
+            if self.series_s {
+                self.flags.insert("CONSOLE".into(), "series-s".into());
+                self.flags.insert("OWN_UPSCALER".into(), "1".into());
+                self.flags
+                    .insert("RENDER_SCALE".into(), format!("{:.2}", self.render_scale));
+            }
+        } else if self.flags.is_empty() && self.preset != "blank" && self.preset != "custom" {
+            self.flags = preset_flags(&self.preset);
         }
         self
+    }
+
+    fn launch_plan(&self) -> LaunchPlan {
+        LaunchPlan {
+            preset: self.preset.clone(),
+            flags: self.flags.clone(),
+            extra_env: self.extra_env.clone(),
+            fullscreen_hook: self.fullscreen,
+        }
     }
 }
 
@@ -287,22 +361,15 @@ fn start_job(
             JobKind::Uninstall => uninstall(&app, &job, project.as_ref().expect("project")),
             JobKind::Play => {
                 let p = project.as_ref().expect("project");
-                let mut extra = settings.extra_env.clone();
-                if settings.fix_8gb {
-                    extra.push_str("\nVICTORY_TEXTURE_DROP_MIPS=2\nVICTORY_NULL_COLOR=grey");
-                }
-                if settings.bright_shadows {
-                    extra.push_str("\nVICTORY_AMBIENT=0.6");
-                }
+                let plan = settings.launch_plan();
+                let env = resolve_env(&plan);
                 play(
                     &app,
                     &job,
                     p,
                     &PathBuf::from(&settings.game_dir),
-                    settings.series_s,
-                    settings.render_scale,
-                    &extra,
-                    settings.fullscreen,
+                    &env,
+                    plan.fullscreen_hook,
                 )
             }
         };
@@ -410,6 +477,49 @@ fn workspace_path() -> String {
     workspace().display().to_string()
 }
 
+#[tauri::command]
+fn flag_catalog() -> FlagCatalog {
+    FlagCatalog {
+        presets: flags::presets(),
+        flags: flags::catalog(),
+    }
+}
+
+#[tauri::command]
+fn apply_preset(state: State<'_, AppState>, preset: String) -> Result<Settings, String> {
+    let mut s = state.settings.lock().clone();
+    s.preset = preset.clone();
+    s.flags = if preset == "custom" {
+        s.flags
+    } else {
+        preset_flags(&preset)
+    };
+    // Keep legacy mirrors roughly in sync for older UI bits.
+    if let Some(console) = s.flags.get("CONSOLE") {
+        s.series_s = console == "series-s";
+    }
+    if let Some(scale) = s.flags.get("RENDER_SCALE") {
+        if let Ok(v) = scale.parse::<f32>() {
+            s.render_scale = v;
+        }
+    }
+    s.fix_8gb = s.flags.get("TEXTURE_DROP_MIPS").map(|v| v != "0").unwrap_or(false)
+        && s.flags.get("NULL_COLOR").map(|v| !v.is_empty()).unwrap_or(false);
+    s.bright_shadows = s
+        .flags
+        .get("AMBIENT")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    save_settings(&state.settings_path, &s)?;
+    *state.settings.lock() = s.clone();
+    Ok(s)
+}
+
+#[tauri::command]
+fn preview_env(state: State<'_, AppState>) -> BTreeMap<String, String> {
+    resolve_env(&state.settings.lock().launch_plan())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     migrate_old_folders();
@@ -443,6 +553,9 @@ pub fn run() {
             defer_update,
             set_install_folder,
             workspace_path,
+            flag_catalog,
+            apply_preset,
+            preview_env,
         ])
         .setup(|app| {
             let _ = tools::detect();

@@ -2,9 +2,11 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { AdvancedSettings } from "./components/AdvancedSettings";
 import { Titlebar } from "./components/Titlebar";
 import type {
   Catalog,
+  FlagCatalog,
   FilesCheck,
   JobSnapshot,
   Project,
@@ -32,6 +34,8 @@ export default function App() {
   const [customLink, setCustomLink] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
+  const [flagCatalog, setFlagCatalog] = useState<FlagCatalog | null>(null);
+  const [preview, setPreview] = useState<Record<string, string>>({});
 
   const refreshCatalog = useCallback(async () => {
     const c = await invoke<Catalog>("fetch_catalog");
@@ -51,11 +55,19 @@ export default function App() {
     return t;
   }, []);
 
-  const persist = useCallback(async (next: Settings) => {
-    const saved = await invoke<Settings>("save_settings_cmd", { settings: next });
-    setSettings(saved);
-    return saved;
+  const refreshPreview = useCallback(async () => {
+    setPreview(await invoke<Record<string, string>>("preview_env"));
   }, []);
+
+  const persist = useCallback(
+    async (next: Settings) => {
+      const saved = await invoke<Settings>("save_settings_cmd", { settings: next });
+      setSettings(saved);
+      await refreshPreview();
+      return saved;
+    },
+    [refreshPreview],
+  );
 
   const checkProject = useCallback(async (project: Project) => {
     const st = await invoke<RepoState>("check_repo", { project });
@@ -76,7 +88,8 @@ export default function App() {
         const s = await invoke<Settings>("get_settings");
         setSettings(s);
         setSelected(s.selected);
-        await Promise.all([refreshCatalog(), refreshFiles(), refreshTools()]);
+        setFlagCatalog(await invoke<FlagCatalog>("flag_catalog"));
+        await Promise.all([refreshCatalog(), refreshFiles(), refreshTools(), refreshPreview()]);
         setJob(await invoke<JobSnapshot>("get_job"));
         const u1 = await listen<JobSnapshot>("job", (e) => setJob(e.payload));
         const u2 = await listen("auto-check", () => {
@@ -93,7 +106,7 @@ export default function App() {
     return () => {
       for (const u of unsubs) u();
     };
-  }, [checkProject, refreshCatalog, refreshFiles, refreshTools]);
+  }, [checkProject, refreshCatalog, refreshFiles, refreshPreview, refreshTools]);
 
   useEffect(() => {
     if (!catalog) return;
@@ -416,80 +429,22 @@ export default function App() {
             <h3>Settings & tools</h3>
             <p className="hint stage">{job.stage || "Idle"}</p>
           </div>
+          {flagCatalog ? (
+            <AdvancedSettings
+              settings={settings}
+              catalog={flagCatalog}
+              preview={preview}
+              onChange={setSettings}
+              onPersist={(next) => void persist(next)}
+              onPreset={(id) => {
+                void invoke<Settings>("apply_preset", { preset: id }).then(async (s) => {
+                  setSettings(s);
+                  await refreshPreview();
+                });
+              }}
+            />
+          ) : null}
           <div className="panel">
-            <div className="grid-2">
-              <label className="check">
-                <input
-                  type="checkbox"
-                  checked={settings.seriesS}
-                  onChange={(e) => {
-                    const next = { ...settings, seriesS: e.target.checked };
-                    setSettings(next);
-                    void persist(next);
-                  }}
-                />
-                Xbox Series S profile
-              </label>
-              <label className="field">
-                Render scale
-                <input
-                  type="number"
-                  min={0.25}
-                  max={1}
-                  step={0.05}
-                  value={settings.renderScale}
-                  onChange={(e) =>
-                    setSettings({ ...settings, renderScale: Number(e.target.value) || 0.5 })
-                  }
-                  onBlur={() => void persist(settings)}
-                />
-              </label>
-              <label className="check">
-                <input
-                  type="checkbox"
-                  checked={settings.fix8gb}
-                  onChange={(e) => {
-                    const next = { ...settings, fix8gb: e.target.checked };
-                    setSettings(next);
-                    void persist(next);
-                  }}
-                />
-                8 GB graphics card fix
-              </label>
-              <label className="check">
-                <input
-                  type="checkbox"
-                  checked={settings.brightShadows}
-                  onChange={(e) => {
-                    const next = { ...settings, brightShadows: e.target.checked };
-                    setSettings(next);
-                    void persist(next);
-                  }}
-                />
-                Brighter shadows
-              </label>
-              <label className="check">
-                <input
-                  type="checkbox"
-                  checked={settings.fullscreen}
-                  onChange={(e) => {
-                    const next = { ...settings, fullscreen: e.target.checked };
-                    setSettings(next);
-                    void persist(next);
-                  }}
-                />
-                Borderless fullscreen
-              </label>
-            </div>
-            <label className="field">
-              Extra VICTORY_* environment lines
-              <textarea
-                value={settings.extraEnv}
-                onChange={(e) => setSettings({ ...settings, extraEnv: e.target.value })}
-                onBlur={() => void persist(settings)}
-                placeholder={"VICTORY_FOO=1\nVICTORY_BAR=2"}
-              />
-            </label>
             <div className="actions">
               <button type="button" className="btn secondary" onClick={() => void browseInstall()}>
                 Install folder…
@@ -508,6 +463,7 @@ export default function App() {
               <span className={`pill ${tools?.msvc ? "good" : "warn"}`}>
                 C++ tools {tools?.msvc ? "ready" : "missing"}
               </span>
+              <span className="pill">Preset · {settings.preset}</span>
             </div>
             {!toolsReady ? (
               <button

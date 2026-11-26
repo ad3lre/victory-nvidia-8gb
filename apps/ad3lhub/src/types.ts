@@ -26,6 +26,9 @@ export type Settings = {
   renderScale: number;
   extraEnv: string;
   gpuFilter: number;
+  preset: string;
+  flags: Record<string, string>;
+  showExpert: boolean;
 };
 
 export type Tools = {
@@ -61,4 +64,28 @@ export type Catalog = {
   featured: Project;
   community: Project[];
   error: string | null;
+};
+
+export type FlagKind = "toggle" | "choice" | "number" | "text";
+
+export type FlagDef = {
+  key: string;
+  label: string;
+  help: string;
+  category: string;
+  kind: FlagKind;
+  choices: string[];
+  default: string;
+  expert: boolean;
+};
+
+export type PresetDef = {
+  id: string;
+  label: string;
+  help: string;
+};
+
+export type FlagCatalog = {
+  presets: PresetDef[];
+  flags: FlagDef[];
 };
