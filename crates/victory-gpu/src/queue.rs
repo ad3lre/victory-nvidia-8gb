@@ -900,7 +900,7 @@ extern "system" fn present(
 ) -> HRESULT {
     #[cfg(not(windows))]
     let _ = this;
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(windows)]
     crate::copystat::present_begins();
     let called = crate::timeline::span("the title's Present");
     #[cfg(all(windows, feature = "diagnostics"))]

@@ -1475,6 +1475,10 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
+        if self.null_store_uav(p, false) {
+            once!(pipeline = p.name, "draw with a null unordered-access view dropped");
+            return false;
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -3129,6 +3133,18 @@ impl State {
             }
             return;
         }
+        // Writing through a null UAV descriptor has hung NVIDIA mid-world
+        // (heap N: null on compute UAVs in crash logs). Skip those dispatches.
+        if self.null_store_uav(p, true) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            once!(pipeline = p.name, "dispatch with a null unordered-access view dropped");
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::pipeline::note_why("a null unordered-access view".to_owned());
+                self.list_dropped_roots([x, y, z]);
+            }
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
@@ -3612,6 +3628,37 @@ impl State {
                 host.slot_tabled(index);
             }
         }
+    }
+
+    /// Whether any table UAV this pipeline stores through currently shows
+    /// no host view (`made` key 0 / "null" in crash breadcrumbs). Writing
+    /// those has hung NVIDIA (`0x887A0006`) in-world.
+    fn null_store_uav(&self, p: &HostPipeline, compute: bool) -> bool {
+        for stage in &p.stages {
+            let t = stage.translated();
+            if !t.stores {
+                continue;
+            }
+            for u in t.used.iter().filter(|u| {
+                u.kind == ResourceType::Uav && u.root == RootType::Table
+            }) {
+                let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot))
+                else {
+                    continue;
+                };
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                let Some(heap) = self.heap_of(handle) else {
+                    continue;
+                };
+                let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
+                    continue;
+                };
+                if host.shows_none(index) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// The descriptors a shader reads through tables. Tables holding a

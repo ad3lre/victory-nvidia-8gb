@@ -2152,6 +2152,17 @@ impl HostHeap {
                 self.put(slot);
                 self.keep(slot, kept);
                 remade += 1;
+            } else {
+                // Host copy moved but the new view cannot be made: leave a
+                // proper null UAV/SRV, not the previous descriptor of memory
+                // that is gone (those hung NVIDIA when shaders wrote them).
+                null_for(&view, self.at(slot));
+                self.put(slot);
+                self.clear_twin(slot);
+                self.write_stride(slot, 0);
+                self.keep(slot, None);
+                self.quick_is(slot, 0);
+                self.made.set(slot, 0);
             }
         }
         remade
@@ -2982,13 +2993,27 @@ impl HostHeap {
     /// reaching whatever the host placed after the buffer.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
+        // RAW FirstElement is in dwords and must begin on 16 bytes.
+        if offset % 16 != 0 || len < 4 {
+            tracing::warn!(offset, len, "raw unordered view not 16-byte aligned left null");
+            self.null_raw_uav_at(index);
+            return;
+        }
         let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        let first = offset / 4;
+        // SAFETY: a live buffer.
+        let width = unsafe { buffer.GetDesc() }.Width;
+        if !buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, first, elements, 0, true, width) {
+            tracing::warn!(offset, len, width, "raw unordered view the host would refuse left null");
+            self.null_raw_uav_at(index);
+            return;
+        }
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_UAV {
-                    FirstElement: offset / 4,
+                    FirstElement: first,
                     NumElements: elements,
                     StructureByteStride: 0,
                     CounterOffsetInBytes: 0,
@@ -4076,6 +4101,39 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
 /// a twin of its own, viewed as a depth texture's without stencil: a view
 /// in the format of the depth plane of a depth-stencil format (21, 46)
 /// takes the twin's colour format too.
+/// Clears `PlaneSlice` on a 2D / 2D-array UAV desc; returns the previous value.
+fn take_uav_plane(desc: &mut D3D12_UNORDERED_ACCESS_VIEW_DESC) -> u32 {
+    match desc.ViewDimension {
+        D3D12_UAV_DIMENSION_TEXTURE2D => {
+            // SAFETY: the member the dimension names.
+            let mut view = unsafe { desc.Anonymous.Texture2D };
+            let plane = std::mem::take(&mut view.PlaneSlice);
+            desc.Anonymous.Texture2D = view;
+            plane
+        }
+        D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: the member the dimension names.
+            let mut view = unsafe { desc.Anonymous.Texture2DArray };
+            let plane = std::mem::take(&mut view.PlaneSlice);
+            desc.Anonymous.Texture2DArray = view;
+            plane
+        }
+        _ => 0,
+    }
+}
+
+/// Host UAV of the textures we create (colour and depth twins) may only
+/// name plane 0. The title's stencil-plane views keep PlaneSlice 1 after
+/// the twin is already R8; CreateUnorderedAccessView then fails the debug
+/// layer and has hung NVIDIA devices in-world.
+fn clamp_uav_plane(texture: &ID3D12Resource, desc: &mut D3D12_UNORDERED_ACCESS_VIEW_DESC) {
+    if take_uav_plane(desc) != 0 {
+        // SAFETY: a live resource, logged only.
+        let format = unsafe { texture.GetDesc() }.Format.0;
+        once!(format, "unordered view PlaneSlice cleared on a non-planar host texture");
+    }
+}
+
 fn twin_uav(
     twin: &ID3D12Resource,
     desc: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>,
@@ -4096,25 +4154,11 @@ fn twin_uav(
         }
         all
     });
-    // A stencil plane's twin (R8 typeless, 60): the title's view is of the
-    // stencil plane if it names plane 1 or a stencil view format (22, 47).
-    if d.Format.0 == 60 {
-        let mut plane = 0;
-        match desc.ViewDimension {
-            D3D12_UAV_DIMENSION_TEXTURE2D => {
-                // SAFETY: the member the dimension names.
-                let mut view = unsafe { desc.Anonymous.Texture2D };
-                plane = std::mem::take(&mut view.PlaneSlice);
-                desc.Anonymous.Texture2D = view;
-            }
-            D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
-                // SAFETY: the member the dimension names.
-                let mut view = unsafe { desc.Anonymous.Texture2DArray };
-                plane = std::mem::take(&mut view.PlaneSlice);
-                desc.Anonymous.Texture2DArray = view;
-            }
-            _ => {}
-        }
+    // A stencil plane's twin (R8 typeless 60, or already typed R8 61/62):
+    // the title's view is of the stencil plane if it names plane 1 or a
+    // stencil view format (22, 47). PlaneSlice must be 0 on the twin.
+    if matches!(d.Format.0, 60 | 61 | 62) {
+        let plane = take_uav_plane(&mut desc);
         if plane != 1 && !matches!(desc.Format.0, 22 | 47) {
             return None;
         }
@@ -4129,6 +4173,7 @@ fn twin_uav(
         (0 | 39 | 40 | 19..=21 | 44..=46, 39) => 41,
         (other, _) => other,
     };
+    clamp_uav_plane(twin, &mut desc);
     Some(desc)
 }
 
@@ -4304,6 +4349,9 @@ fn make_twinned(
             };
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
+            }
+            if let Some(desc) = &mut desc {
+                clamp_uav_plane(texture, desc);
             }
             // SAFETY: a live texture and a slot of our heap.
             unsafe {

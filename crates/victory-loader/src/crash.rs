@@ -17,8 +17,8 @@ use windows_sys::Win32::Foundation::{
 };
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, M128A, RtlLookupFunctionEntry,
-    RtlVirtualUnwind, SetUnhandledExceptionFilter, UNW_FLAG_NHANDLER,
+    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, IsDebuggerPresent, M128A,
+    RtlLookupFunctionEntry, RtlVirtualUnwind, SetUnhandledExceptionFilter, UNW_FLAG_NHANDLER,
 };
 use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -156,14 +156,53 @@ pub fn report_crashes() {
 }
 
 /// What the vectored handler reports as it happens.
-const FATAL: [i32; 6] = [
+///
+/// Breakpoints are handled separately ([`soft_breakpoint`]): titles assert
+/// with `int3` and, without a debugger, that ends the process. Soft-skipping
+/// the instruction keeps sessions alive (seen as repeated
+/// `0x80000003` at a fixed title RVA in crash logs).
+const FATAL: [i32; 5] = [
     EXCEPTION_ACCESS_VIOLATION,
     EXCEPTION_ILLEGAL_INSTRUCTION,
     EXCEPTION_PRIV_INSTRUCTION,
     EXCEPTION_INT_DIVIDE_BY_ZERO,
     EXCEPTION_STACK_OVERFLOW,
-    EXCEPTION_BREAKPOINT,
 ];
+
+/// Skip a title `int3` / `int 3` when no debugger is attached. Rate-limited
+/// logging so a hot assert does not flood the console.
+unsafe fn soft_breakpoint(info: *mut EXCEPTION_POINTERS) -> bool {
+    // SAFETY: the system passes valid exception pointers.
+    unsafe {
+        let record = &*(*info).ExceptionRecord;
+        if record.ExceptionCode != EXCEPTION_BREAKPOINT {
+            return false;
+        }
+        // A real debugger session should still stop on int3.
+        if IsDebuggerPresent() != 0 {
+            return false;
+        }
+        let context = &mut *(*info).ContextRecord;
+        let at = context.Rip as *const u8;
+        // int3 is 0xCC; CD 03 is the two-byte encoding. Only skip those.
+        let byte = at.read();
+        let skip = match byte {
+            0xcc => 1u64,
+            0xcd if at.add(1).read() == 0x03 => 2,
+            _ => return false,
+        };
+        static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            eprintln!(
+                "VIctory: soft-continued breakpoint at {} (#{n})",
+                locate(context.Rip as usize)
+            );
+        }
+        context.Rip += skip;
+        true
+    }
+}
 
 /// Console CPUs are Zen 2: titles use AMD-only instructions Intel CPUs
 /// lack. Does their job instead: `clzero` (`0f 01 fc`) zeroes the 64-byte
@@ -509,6 +548,10 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
     // SAFETY: the system passes valid exception pointers.
     if unsafe { emulate_amd_only(info) } {
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
+    // SAFETY: as above.
+    if unsafe { soft_breakpoint(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.

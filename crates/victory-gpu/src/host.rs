@@ -865,6 +865,7 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         }
     }
     tracing::error!("{text}");
+    victory_telemetry::events::note("device_removed", &text);
     // Tests have no log: the reason goes to their output.
     #[cfg(test)]
     eprintln!("host GPU failure: {text}");
@@ -5666,9 +5667,7 @@ impl Host {
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
-        #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
-        #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
@@ -5771,9 +5770,7 @@ impl Host {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         ahead.part(14);
-        #[cfg(feature = "diagnostics")]
         let lock = (started - called).as_micros() as u64;
-        #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
@@ -5952,7 +5949,6 @@ impl Host {
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
-            #[cfg(feature = "diagnostics")]
             crate::copystat::submission_ends(lock);
             let sent = Sent {
                 number: this_submission,
@@ -6103,7 +6099,6 @@ impl Host {
         }
         self.log_messages();
         submitting(0, 0);
-        #[cfg(feature = "diagnostics")]
         crate::copystat::submission_ends(lock);
         // With the relay: nothing is in the air now, so no fetch still to
         // be merged is older than the sends to card copies so far, and
@@ -8977,7 +8972,6 @@ impl Meter {
     fn frame(&mut self, hwnd: HWND) {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
-        #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
@@ -9000,9 +8994,21 @@ impl Meter {
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
         });
+        let budget = crate::copystat::telem_window(frames);
         // Always publish, even with telemetry and the overlay off: the ring
         // is cheap and the recorder only reads it when a run has opted in.
-        victory_telemetry::metrics::publish(fps, ms, draws, cpu, gpu);
+        victory_telemetry::metrics::publish(victory_telemetry::metrics::Metrics {
+            fps,
+            ms,
+            draws,
+            cpu_ms: cpu,
+            gpu_ms: gpu,
+            after_present_ms: budget.after_present_ms,
+            until_submit_ms: budget.until_submit_ms,
+            watch_ms: budget.watch_ms,
+            guard_ms: budget.guard_ms,
+            guard_faults: budget.guard_faults,
+        });
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames

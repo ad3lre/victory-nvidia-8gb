@@ -21,6 +21,7 @@
 // unused there.
 #![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 
+pub mod events;
 pub mod json;
 mod logs;
 pub mod metrics;
@@ -454,6 +455,33 @@ fn git_sha() -> &'static str {
     env!("VICTORY_TELEMETRY_GIT_SHA")
 }
 
+/// Active `VICTORY_*` switches (values truncated; path-like values redacted).
+fn launch_fingerprint() -> Json {
+    let mut switches = Vec::new();
+    let mut vars: Vec<(String, String)> = std::env::vars()
+        .filter(|(key, _)| key.starts_with("VICTORY_"))
+        .collect();
+    vars.sort_by(|a, b| a.0.cmp(&b.0));
+    for (key, value) in vars.into_iter().take(80) {
+        if matches!(
+            key.as_str(),
+            "VICTORY_TELEMETRY_AGENT" | "VICTORY_TELEMETRY"
+        ) {
+            continue;
+        }
+        let value = if value.contains('\\') || value.contains('/') || value.len() > 120 {
+            "<path>".to_owned()
+        } else {
+            value.chars().take(80).collect()
+        };
+        switches.push(Json::Obj(vec![
+            ("name", Json::string(key)),
+            ("value", Json::string(value)),
+        ]));
+    }
+    Json::Obj(vec![("switches", Json::Arr(switches))])
+}
+
 fn notice(dir: &std::path::Path) {
     let path = dir.join("NOTICE.txt");
     if path.exists() {
@@ -465,9 +493,10 @@ fn notice(dir: &std::path::Path) {
          so frame-rate regressions can be compared across builds. A sibling \
          recorder process keeps uploading if the game crashes. Reports contain \
          PC specs, driver versions, screen size, temperatures where available, \
-         the exact FPS timeline, heavily compressed game-window screenshots every \
-         ten seconds for the first twenty minutes, and bounded Victory/title crash \
-         and game log files from the run. They contain no game packages, usernames \
+         the exact FPS timeline with Victory frame-budget counters, host memory \
+         pressure, heavily compressed game-window screenshots every ten seconds for \
+         the first twenty minutes, the Victory runtime log, and bounded Victory/title \
+         crash and game log files from the run. They contain no game packages, usernames \
          or network addresses; embedded paths in logs are redacted on the server. \
          Your machine has an anonymous random key so runs from different PCs can \
          be told apart.\n\n\
@@ -603,7 +632,7 @@ fn make_ingest_bundle(
             "samples",
             Json::Arr(samples.iter().map(Sample::to_json).collect()),
         ),
-        ("events", Json::Arr(vec![])),
+        ("events", Json::Arr(events::all())),
         ("summary", summary.to_json()),
     ];
     if partial {
@@ -848,6 +877,7 @@ fn record(options: Options, ids: RecordIds, stop: StopSource) {
                 ("console", Json::string(options.console)),
             ]),
         ),
+        ("launch", launch_fingerprint()),
     ]);
 
     let local_manifest = Json::Obj(vec![
@@ -986,7 +1016,7 @@ fn record(options: Options, ids: RecordIds, stop: StopSource) {
             last_ingest = Instant::now();
         }
         let windows = metrics::drain(&mut cursor);
-        let (cpu_pct, gpu_pct, ram_mb) = windows::rates(game_pid);
+        let host = windows::rates(game_pid);
         let (cpu_temp_c, cpu_temp_reason, gpu_temp_c, gpu_temp_reason) = windows::temperatures();
         for metrics in windows {
             let sample = Sample {
@@ -996,9 +1026,19 @@ fn record(options: Options, ids: RecordIds, stop: StopSource) {
                 draws: metrics.draws,
                 cpu_ms: metrics.cpu_ms,
                 gpu_ms: metrics.gpu_ms,
-                cpu_pct,
-                gpu_pct,
-                ram_mb,
+                after_present_ms: metrics.after_present_ms,
+                until_submit_ms: metrics.until_submit_ms,
+                watch_ms: metrics.watch_ms,
+                guard_ms: metrics.guard_ms,
+                guard_faults: metrics.guard_faults,
+                cpu_pct: host.cpu_pct,
+                gpu_pct: host.gpu_pct,
+                ram_mb: host.ram_mb,
+                ram_avail_mb: host.ram_avail_mb,
+                commit_avail_mb: host.commit_avail_mb,
+                page_faults: host.page_faults,
+                proc_user_ms: host.proc_user_ms,
+                proc_kernel_ms: host.proc_kernel_ms,
                 cpu_temp_c,
                 cpu_temp_reason: cpu_temp_reason.clone(),
                 gpu_temp_c,

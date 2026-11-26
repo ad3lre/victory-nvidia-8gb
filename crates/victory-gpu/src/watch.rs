@@ -255,7 +255,6 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
             found.resize(count, 0);
         }
         let mut granularity = 0;
-        #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         // SAFETY: the answer buffer holds `count` entries.
         let failed = unsafe {
@@ -276,12 +275,14 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         if failed {
             return None;
         }
-        #[cfg(feature = "diagnostics")]
         {
-            tally(12, count as u64);
             use crate::copystat::{C, add};
             add(C::Watches, 1);
             add(C::WatchUs, started.elapsed().as_micros() as u64);
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            tally(12, count as u64);
             slow(started.elapsed().as_micros() as u64);
             tally(0, 1);
             tally(1, ((last - first) * (PAGE >> 10)) as u64);
@@ -692,10 +693,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             if !guarded {
                 return None;
             }
-            #[cfg(feature = "diagnostics")]
             let guarding = std::time::Instant::now();
             let written = guard(first * PAGE, last * PAGE).map(|pages| pages.into_iter().map(|p| (p, WHOLE)).collect::<Vec<_>>());
-            #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
                 let us = guarding.elapsed().as_micros() as u64;
@@ -703,6 +702,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 if written.is_some() {
                     add(C::Watches, 1);
                     add(C::WatchUs, us);
+                    #[cfg(feature = "diagnostics")]
                     slow(us);
                 }
             }
@@ -2624,9 +2624,9 @@ pub(crate) fn install() {
             if opened != 0 {
                 g.opened(block);
                 drop(g);
+                crate::copystat::add(crate::copystat::C::GuardFaults, 1);
                 #[cfg(feature = "diagnostics")]
                 {
-                    crate::copystat::add(crate::copystat::C::GuardFaults, 1);
                     let ns = waited.as_nanos().min(u128::from(u32::MAX)) as usize;
                     let held = (began.elapsed() - waited).as_nanos() as u64;
                     crate::faultbook::note(crate::faultbook::What::Fault, block, opened << 32 | ns, held);

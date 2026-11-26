@@ -32,7 +32,40 @@ unsafe impl Sync for SdkPath {}
 pub static D3D12SDKPath: SdkPath = SdkPath(c".\\D3D12\\".as_ptr());
 
 /// The folder `D3D12SDKPath` names, beside the running executable.
-#[allow(dead_code)]
 pub fn runtime_dir() -> Option<std::path::PathBuf> {
     Some(std::env::current_exe().ok()?.parent()?.join("D3D12"))
+}
+
+/// Floor size for a real Agility `D3D12Core.dll` (1.620.2 is several MB). A
+/// truncated placeholder next to the exe still yields `0x887E0003`.
+const MIN_CORE_BYTES: u64 = 100_000;
+
+/// Before `--execute`: refuse to start if `D3D12\D3D12Core.dll` is missing or
+/// truncated. Device creation otherwise fails later with the opaque
+/// `0x887e0003` / `D3D12_ERROR_INVALID_REDIST` the title throws as a C++
+/// exception — with nothing saying the redistributable was the cause.
+pub fn require_for_execute() -> anyhow::Result<()> {
+    let dir = runtime_dir().ok_or_else(|| {
+        anyhow::anyhow!("cannot locate the executable directory to find .\\D3D12\\D3D12Core.dll")
+    })?;
+    let dll = dir.join("D3D12Core.dll");
+    let meta = match std::fs::metadata(&dll) {
+        Ok(meta) if meta.is_file() => meta,
+        _ => anyhow::bail!(
+            "Agility SDK runtime missing: {} not found. Rebuild so apps/victory/build.rs \
+             installs Microsoft.Direct3D.D3D12 1.620.2 under .\\D3D12\\ next to victory.exe \
+             (without this, device creation fails with 0x887E0003)",
+            dll.display()
+        ),
+    };
+    if meta.len() < MIN_CORE_BYTES {
+        anyhow::bail!(
+            "Agility SDK runtime looks truncated at {} ({} bytes). Delete it and rebuild so \
+             build.rs reinstalls Microsoft.Direct3D.D3D12 1.620.2; a bad DLL fails device \
+             creation with 0x887E0003",
+            dll.display(),
+            meta.len()
+        );
+    }
+    Ok(())
 }

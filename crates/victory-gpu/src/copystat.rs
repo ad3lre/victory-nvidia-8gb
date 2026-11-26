@@ -1026,6 +1026,7 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
 pub(crate) fn recorded(started: std::time::Instant) {
     let took = started.elapsed();
     let ns = took.as_nanos() as u64;
+    #[cfg(feature = "diagnostics")]
     crate::timeline::called(took);
     add(C::RecordCalls, 1);
     add(C::RecordNs, ns);
@@ -1132,11 +1133,54 @@ fn page_faults() -> u64 {
     u64::from(c.PageFaultCount)
 }
 
+/// One-second window for anonymous telemetry (release and diagnostics).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TelemWindow {
+    pub after_present_ms: f64,
+    pub until_submit_ms: f64,
+    pub watch_ms: f64,
+    pub guard_ms: f64,
+    pub guard_faults: f64,
+}
+
+/// Peeks frame-budget counters for telemetry (does not zero them, so the
+/// diagnostics [`log`] can still take them). Survives a counter reset by
+/// treating a drop as a fresh baseline.
+pub(crate) fn telem_window(frames: f64) -> TelemWindow {
+    static LAST: std::sync::Mutex<[u64; 5]> = std::sync::Mutex::new([0; 5]);
+    let now = [
+        peek(C::UntilRecordUs),
+        peek(C::UntilSubmitUs),
+        peek(C::WatchUs),
+        peek(C::GuardUs),
+        peek(C::GuardFaults),
+    ];
+    let frames = frames.max(1.0);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let mut delta = [0u64; 5];
+    for i in 0..5 {
+        delta[i] = if now[i] >= last[i] {
+            now[i] - last[i]
+        } else {
+            now[i]
+        };
+        last[i] = now[i];
+    }
+    TelemWindow {
+        after_present_ms: delta[0] as f64 / 1e3 / frames,
+        until_submit_ms: delta[1] as f64 / 1e3 / frames,
+        watch_ms: delta[2] as f64 / 1e3 / frames,
+        guard_ms: delta[3] as f64 / 1e3 / frames,
+        guard_faults: delta[4] as f64 / frames,
+    }
+}
+
 /// Logs the counters per frame, and the ranges that took most bytes. The
 /// counters run from line to line, so they are divided by the frames
 /// presented since the last line, not by `frames` (the frames of the last
 /// second or more: a 4 s frame after an unlogged 4 s frame showed two
 /// frames' counts as one's).
+#[cfg(feature = "diagnostics")]
 pub(crate) fn log(frames: f64) {
     let counted = taken(C::Frames as usize);
     let frames = if counted > 0 { counted as f64 } else { frames };

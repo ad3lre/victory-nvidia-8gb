@@ -19,6 +19,12 @@ if not exist "%runner%" (
   echo Extract the Windows release or run cargo build --release --locked -p victory. 1>&2
   exit /b 2
 )
+for %%I in ("%runner%") do set "runner_dir=%%~dpI"
+if not exist "%runner_dir%D3D12\D3D12Core.dll" (
+  echo Agility SDK missing: %runner_dir%D3D12\D3D12Core.dll 1>&2
+  echo Rebuild so apps\victory\build.rs installs D3D12Core.dll next to victory.exe ^(else 0x887E0003^). 1>&2
+  exit /b 2
+)
 if not defined VICTORY_AMBIENT_AIR set "VICTORY_AMBIENT_AIR=1.5"
 if not defined VICTORY_CACHE_DIR set "VICTORY_CACHE_DIR=%LOCALAPPDATA%\VIctory\cache-pareto"
 if not defined VICTORY_TEXTURE_NO_WAIT set "VICTORY_TEXTURE_NO_WAIT=1"

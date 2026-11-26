@@ -82,6 +82,7 @@ fn interesting_file(path: &Path) -> bool {
         return false;
     }
     lower.contains("victory")
+        || lower == "victory-runtime.log"
         || lower.contains("crash")
         || lower.contains("breakpad")
         || lower.contains("gta")

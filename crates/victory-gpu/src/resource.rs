@@ -251,6 +251,41 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// Whether the host accepts `format` as a typed unordered-access texture.
+/// Queried once per distinct format; typeless parents are accepted (views
+/// pick a typed member).
+#[cfg(windows)]
+fn host_uav_format(format: u32) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    // Typeless: CreateCommittedResource allows ALLOW_UNORDERED_ACCESS; the
+    // view names a typed member.
+    if format != 0 && family(format) == format && family(format + 1) == format {
+        return true;
+    }
+    let Some(host) = crate::host::host() else {
+        return true;
+    };
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    // SAFETY: a plain query into our own structure.
+    let asked = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    };
+    asked.is_ok() && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+}
+
+#[cfg(not(windows))]
+fn host_uav_format(_format: u32) -> bool {
+    true
+}
+
 /// The format of a texture the host GPU renders to or writes as unordered
 /// access, for the title's `format`. The console's GPU does both with the
 /// 16-bit colour formats B5G5R5A1 (86) and B4G4R4A4 (115), and
@@ -2546,6 +2581,14 @@ fn host_texture_as(
     // their unordered access views plain UNORM.
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
+    }
+    // A texture with ALLOW_UNORDERED_ACCESS whose format the host cannot
+    // use as UAV: CreateCommittedResource fails the debug layer and the
+    // resource never appears. Drop the flag; views then fall through to
+    // null (fits refuses unordered without the flag).
+    if d.flags & UNORDERED != 0 && !host_uav_format(d.format) {
+        tracing::info!(format = d.format, "host cannot unordered-access this format: flag dropped");
+        d.flags &= !UNORDERED;
     }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).

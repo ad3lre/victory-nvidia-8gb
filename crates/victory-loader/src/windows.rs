@@ -254,10 +254,18 @@ impl LoadedImage {
         if !unresolved.is_empty() {
             let mut block = ThunkBlock::new(unresolved.len())?;
             for (slot, dll, symbol) in unresolved {
+                let name = symbol.to_string();
+                // FidelityFX and similar: return 0 even under Trap so a missing
+                // upscaler stub does not abort the process.
+                let site_policy = if crate::thunks::soft_unimplemented(dll, &name) {
+                    UnimplementedPolicy::ReturnZero
+                } else {
+                    policy
+                };
                 let site: &'static ImportSite = Box::leak(Box::new(ImportSite {
                     dll: dll.to_owned(),
-                    symbol: symbol.to_string(),
-                    policy,
+                    symbol: name,
+                    policy: site_policy,
                     calls: AtomicU64::new(0),
                 }));
                 slots.push((slot, block.emit(site)?));

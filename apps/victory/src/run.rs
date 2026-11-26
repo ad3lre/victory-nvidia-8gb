@@ -50,6 +50,7 @@ pub fn run(
 
     if execute {
         check_cpu_features()?;
+        crate::agility::require_for_execute()?;
     }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
@@ -220,11 +221,17 @@ pub fn run(
                 title_hash: hash.to_string(),
                 console: victory_hle::console::current().name().to_owned(),
                 disabled: false,
-                log_roots: vec![
-                    temp.with_file_name("crashes.log"),
-                    temp.clone(),
-                    title_dir.to_path_buf(),
-                ],
+                log_roots: {
+                    let mut roots = vec![
+                        temp.with_file_name("crashes.log"),
+                        temp.clone(),
+                        title_dir.to_path_buf(),
+                    ];
+                    if let Some(path) = victory_core::logging::runtime_log_path() {
+                        roots.push(path.clone());
+                    }
+                    roots
+                },
             }),
             Err(error) => {
                 tracing::warn!(%error, "telemetry directory unavailable; continuing without telemetry");

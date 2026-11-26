@@ -34,6 +34,20 @@ pub enum UnimplementedPolicy {
     ReturnZero,
 }
 
+/// Imports that abort under [`UnimplementedPolicy::Trap`] but are safe to
+/// soft-fail: the title tolerates a null/failed context (FidelityFX upscaler
+/// init). Without this, `amd_fidelityfx_loader_xbox.dll!ffxCreateContext`
+/// ends the process during bring-up.
+pub fn soft_unimplemented(dll: &str, symbol: &str) -> bool {
+    let dll = dll.to_ascii_lowercase();
+    let symbol = symbol.to_ascii_lowercase();
+    dll.contains("fidelityfx")
+        && (symbol.contains("ffxcreatecontext")
+            || symbol.contains("ffxdestroycontext")
+            || symbol.contains("ffxdispatch")
+            || symbol.contains("ffxconfigure"))
+}
+
 /// Identifies one unresolved import. Leaked: lives as long as the process.
 #[derive(Debug)]
 pub struct ImportSite {
@@ -152,6 +166,20 @@ impl ThunkBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fidelityfx_create_context_soft_fails() {
+        assert!(soft_unimplemented(
+            "amd_fidelityfx_loader_xbox.dll",
+            "ffxCreateContext"
+        ));
+        assert!(soft_unimplemented(
+            "AMD_FidelityFX_Loader_Xbox.dll",
+            "ffxDestroyContext"
+        ));
+        assert!(!soft_unimplemented("d3d12_xs.dll", "D3D12CreateDevice"));
+        assert!(!soft_unimplemented("amd_fidelityfx_loader_xbox.dll", "SomethingElse"));
+    }
 
     /// In a child process of the next test: calls an unimplemented import
     /// that traps, with the crash log where `VICTORY_TRAP_LOG` says.

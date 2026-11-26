@@ -59,13 +59,26 @@ already measures (the same numbers shown in the title caption):
 - `fps`, `ms`, `draws` — frames/s, ms/frame, draws/frame;
 - `cpu_ms`, `gpu_ms` — ms/frame spent preparing submissions and waiting on the
   GPU, from the existing submission counters;
+- `after_present_ms`, `until_submit_ms` — ms after present until the title's
+  first list call / first submission (Victory frame budget);
+- `watch_ms`, `guard_ms`, `guard_faults` — write-watch / guard cost and fault
+  rate from the same counters the diagnostics frame line uses;
 - `cpu_pct`, `gpu_pct` — system CPU load and summed 3D-engine load, when the
   Windows counters are available;
 - `ram_mb` — this process's working set;
+- `ram_avail_mb`, `commit_avail_mb` — host physical / commit headroom;
+- `page_faults`, `proc_user_ms`, `proc_kernel_ms` — process fault and CPU-time
+  deltas for the sample window;
 - `cpu_temp_c` — CPU package temperature from Windows thermal zones, when that
   counter exists, plus `cpu_temp_reason` explaining `null` otherwise;
 - `gpu_temp_c` — **not collected in v1**: `null` with reason
   `NVAPI temperature reader not enabled in v1`. GPU load and VRAM are present.
+
+The manifest also carries a `launch.switches` fingerprint of active `VICTORY_*`
+environment variables (path-like values redacted). Structured `events` may
+include `device_removed`. The Victory runtime log
+(`…/data/logs/victory-runtime.log`) is uploaded with the other crash/game logs
+when present.
 
 The client and server compute summary statistics from these one-second
 averages and the server renders an SVG FPS graph. The fields named frame-time

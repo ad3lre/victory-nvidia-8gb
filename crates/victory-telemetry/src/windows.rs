@@ -20,8 +20,8 @@ use windows_sys::Win32::System::SystemInformation::{
     GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, GetCurrentProcessId, GetSystemTimes, OpenEventW,
-    OpenProcess, PROCESS_SYNCHRONIZE, SetEvent, WaitForSingleObject,
+    CreateEventW, GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, GetSystemTimes,
+    OpenEventW, OpenProcess, PROCESS_SYNCHRONIZE, SetEvent, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId,
@@ -274,9 +274,26 @@ static CPU: OnceLock<Mutex<CpuTimes>> = OnceLock::new();
 static GPU_3D: OnceLock<Option<PdhCounter>> = OnceLock::new();
 static THERMAL: OnceLock<Option<PdhCounter>> = OnceLock::new();
 
-/// CPU/GPU load and a process working set, sampled once a second.
-/// `target_pid` is the game process (the sidecar agent is a different PID).
-pub fn rates(target_pid: u32) -> (Option<f64>, Option<f64>, Option<f64>) {
+/// Host counters sampled once a second alongside the game's frame window.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HostRates {
+    pub cpu_pct: Option<f64>,
+    pub gpu_pct: Option<f64>,
+    pub ram_mb: Option<f64>,
+    pub ram_avail_mb: Option<f64>,
+    pub commit_avail_mb: Option<f64>,
+    /// Page faults in the game process since the previous sample.
+    pub page_faults: Option<f64>,
+    /// Process user-mode CPU ms since the previous sample (all threads).
+    pub proc_user_ms: Option<f64>,
+    /// Process kernel-mode CPU ms since the previous sample (all threads).
+    pub proc_kernel_ms: Option<f64>,
+}
+
+/// CPU/GPU load, process working set, host memory headroom, and process
+/// user/kernel time. `target_pid` is the game process (the sidecar agent is a
+/// different PID).
+pub fn rates(target_pid: u32) -> HostRates {
     let (idle, total) = cpu_times();
     let state = CPU.get_or_init(|| Mutex::new(CpuTimes(0, 0)));
     let cpu = if let Ok(mut last) = state.lock() {
@@ -297,31 +314,75 @@ pub fn rates(target_pid: u32) -> (Option<f64>, Option<f64>, Option<f64>) {
         .and_then(PdhCounter::values)
         .map(|values| values.into_iter().sum::<f64>().clamp(0.0, 100.0));
 
-    let ram = unsafe {
-        // PROCESS_QUERY_LIMITED_INFORMATION is enough for GetProcessMemoryInfo.
+    let mut memory: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    memory.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    let (ram_avail_mb, commit_avail_mb) = if unsafe { GlobalMemoryStatusEx(&mut memory) } != 0 {
+        (
+            Some(memory.ullAvailPhys as f64 / MB),
+            Some(memory.ullAvailPageFile as f64 / MB),
+        )
+    } else {
+        (None, None)
+    };
+
+    static PROC: OnceLock<Mutex<(u64, u64, u64)>> = OnceLock::new();
+    let mut ram = None;
+    let mut page_faults = None;
+    let mut proc_user_ms = None;
+    let mut proc_kernel_ms = None;
+    unsafe {
+        // PROCESS_QUERY_LIMITED_INFORMATION is enough for GetProcessMemoryInfo /
+        // GetProcessTimes.
         const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
         let handle = if target_pid == GetCurrentProcessId() {
             GetCurrentProcess()
         } else {
             OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, target_pid)
         };
-        if handle.is_null() {
-            None
-        } else {
+        if !handle.is_null() {
             let mut pm = std::mem::zeroed::<PROCESS_MEMORY_COUNTERS_EX>();
             pm.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
-            let ok = GetProcessMemoryInfo(handle, std::ptr::from_mut(&mut pm).cast(), pm.cb);
+            if GetProcessMemoryInfo(handle, std::ptr::from_mut(&mut pm).cast(), pm.cb) != 0 {
+                ram = Some(pm.WorkingSetSize as f64 / MB);
+                let faults = u64::from(pm.PageFaultCount);
+                let state = PROC.get_or_init(|| Mutex::new((0, 0, 0)));
+                if let Ok(mut last) = state.lock() {
+                    page_faults = Some(faults.saturating_sub(last.0) as f64);
+                    last.0 = faults;
+                }
+            }
+            let zero = FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            };
+            let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+            if GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) != 0 {
+                let ft = |t: FILETIME| u64::from(t.dwHighDateTime) << 32 | u64::from(t.dwLowDateTime);
+                // FILETIME is 100 ns units.
+                let (user_100ns, kernel_100ns) = (ft(user), ft(kernel));
+                let state = PROC.get_or_init(|| Mutex::new((0, 0, 0)));
+                if let Ok(mut last) = state.lock() {
+                    proc_user_ms = Some(user_100ns.saturating_sub(last.1) as f64 / 10_000.0);
+                    proc_kernel_ms = Some(kernel_100ns.saturating_sub(last.2) as f64 / 10_000.0);
+                    last.1 = user_100ns;
+                    last.2 = kernel_100ns;
+                }
+            }
             if target_pid != GetCurrentProcessId() {
                 CloseHandle(handle);
             }
-            if ok == 0 {
-                None
-            } else {
-                Some(pm.WorkingSetSize as f64 / MB)
-            }
         }
     };
-    (cpu, gpu, ram)
+    HostRates {
+        cpu_pct: cpu,
+        gpu_pct: gpu,
+        ram_mb: ram,
+        ram_avail_mb,
+        commit_avail_mb,
+        page_faults,
+        proc_user_ms,
+        proc_kernel_ms,
+    }
 }
 
 /// CPU package temperature through Windows thermal zones, if the machine
