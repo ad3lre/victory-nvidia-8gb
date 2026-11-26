@@ -170,7 +170,7 @@ mod shm {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Memory::{
         CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, OpenFileMappingW, PAGE_READWRITE,
-        UnmapViewOfFile,
+        MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile,
     };
 
     /// Layout: `version`, `next`, then RING slots of SLOT_WORDS AtomicU64.
@@ -191,7 +191,7 @@ mod shm {
             // SAFETY: view/handle were created as a pair and are unique to this Mapping.
             unsafe {
                 if !self.view.is_null() {
-                    UnmapViewOfFile(self.view.cast());
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.view.cast() });
                 }
                 if !self.handle.is_null() {
                     CloseHandle(self.handle);
@@ -280,7 +280,7 @@ mod shm {
             return Err("CreateFileMappingW failed".into());
         }
         // SAFETY: handle is a valid mapping of BYTES.
-        let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, BYTES) };
+        let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, BYTES) }.Value;
         if view.is_null() {
             unsafe { CloseHandle(handle) };
             return Err("MapViewOfFile failed".into());
@@ -310,7 +310,7 @@ mod shm {
         if handle.is_null() {
             return Err("OpenFileMappingW failed".into());
         }
-        let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, BYTES) };
+        let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, BYTES) }.Value;
         if view.is_null() {
             unsafe { CloseHandle(handle) };
             return Err("MapViewOfFile failed".into());
@@ -320,7 +320,7 @@ mod shm {
         let version = unsafe { (*view).load(Ordering::Acquire) };
         if version != 0 && version != SHM_VERSION {
             unsafe {
-                UnmapViewOfFile(view.cast());
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.cast() });
                 CloseHandle(handle);
             }
             return Err(format!(
