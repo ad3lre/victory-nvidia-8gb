@@ -86,18 +86,34 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
 
 /// Confirmed first-scene producers. Prepare these at creation even on a cold
 /// launch so cutscene lighting, tiling, and bakes never miss their first frame.
+/// Boot→world gate shaders (bound just before `core_restofworld` opens) are
+/// included so a cold first Play does not stall in the empty ~19-draw present.
 fn scene_input(shaders: &[Arc<Shader>]) -> bool {
-    shaders.iter().any(|s| {
-        matches!(
-            s.hash.as_str(),
-            "970c4fbb3b017c0e"
-                | "068c90badc86f1fd"
-                | "e4a7e088c7780ce8"
-                | "ebe4e53f031f5249"
-                | "2cc4c197ee29e291"
-                | "369cbe906ea72764"
-        ) || crate::draw::BAKE_PIXEL_SHADERS.contains(&s.hash.as_str())
-    })
+    shaders
+        .iter()
+        .any(|s| scene_input_hash(s.hash.as_str()) || crate::draw::BAKE_PIXEL_SHADERS.contains(&s.hash.as_str()))
+}
+
+/// Shader content hashes that must start at creation ([`scene_input`]).
+fn scene_input_hash(hash: &str) -> bool {
+    matches!(
+        hash,
+        "970c4fbb3b017c0e"
+            | "068c90badc86f1fd"
+            | "e4a7e088c7780ce8"
+            | "ebe4e53f031f5249"
+            | "2cc4c197ee29e291"
+            | "369cbe906ea72764"
+            // Boot UI / world-pack gate (telemetry: after these, `core_restofworld`).
+            | "571fe570756bc393"
+            | "02c6cf86ca283ce1"
+            | "d166c341988178de"
+            | "e370f602fa0db9b2"
+            | "f7f331c8c5b3a0d8"
+            | "3bfe730f7e24ee1a"
+            | "80cb958cde505e15"
+            | "f9bf13c6c099ccec"
+    )
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -570,6 +586,24 @@ mod tests {
         assert_eq!(worker_count_for(None, 16, true), 8);
         assert_eq!(worker_count_for(None, 24, true), 8);
         assert_eq!(worker_count_for(Some(12), 8, true), 12);
+    }
+
+    #[test]
+    fn boot_gate_shader_hashes_are_scene_input() {
+        for hash in [
+            "571fe570756bc393",
+            "02c6cf86ca283ce1",
+            "d166c341988178de",
+            "e370f602fa0db9b2",
+            "f7f331c8c5b3a0d8",
+            "3bfe730f7e24ee1a",
+            "80cb958cde505e15",
+            "f9bf13c6c099ccec",
+            "970c4fbb3b017c0e",
+        ] {
+            assert!(scene_input_hash(hash), "{hash}");
+        }
+        assert!(!scene_input_hash("deadbeefdeadbeef"));
     }
 
     /// A first use queues the pipeline and, within the budget, gets the

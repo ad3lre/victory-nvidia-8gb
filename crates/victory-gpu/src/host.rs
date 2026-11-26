@@ -2650,12 +2650,13 @@ fn relay_exact() -> bool {
 /// a few milliseconds of copying, and everything that waits for a landing
 /// (the title's fences, reads of memory flights may write) waited with it.
 ///
-/// What changes: the fetch runs when its flights are done and beside later
-/// submissions, so of the sends of title bytes it is only known to have run
-/// behind those its own flights ran behind (`CardPlan::sent_as`). Bytes sent
-/// later are left out of the merge (`Shadow::card_merge_relay`): they are
-/// the title's, newer than what the flights wrote. A later flight's bytes
-/// may be in what is fetched, as before.
+/// On the copy queue the fetch still runs off the drawing queue, but it
+/// must [`ID3D12CommandQueue::Wait`] for every graphics submission already
+/// signalled on the host fence before it reads those buffers: D3D12 forbids
+/// concurrent write+read across queue type classes, and copy-queue access
+/// needs the buffers to have decayed to COMMON. Skipping that wait removed
+/// NVIDIA devices (`DXGI_ERROR_INVALID_CALL` / `0x887A0001`) and crashed
+/// AMD's driver (`amdxc64` null this at `+0x861b9f`).
 fn relay_copy() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_COPY").is_some_and(|v| v == "1"))
@@ -4877,16 +4878,11 @@ impl Host {
         for (shadow, lo, hi, _) in &pieces {
             traffic::moved(traffic::FETCHED, shadow.span(), std::iter::once((*lo, *hi)));
         }
-        // The sends these flights ran behind, all a fetch on the copy queue
-        // is known to have run behind.
-        let behind = plans.iter().map(|p| p.0.sent_as).max().unwrap_or(0);
         if pieces.is_empty() {
             // Nothing to fetch: every send so far is older than the next
-            // fetch, if that goes to the queue the sends went to.
-            let after = match fetch.as_ref().is_some_and(|f| f.queue.is_some()) {
-                true => behind,
-                false => *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()),
-            };
+            // fetch. Copy-queue fetches Wait for the host fence covering
+            // those sends; drawing-queue fetches are ordered with them.
+            let after = *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
             crate::shadow::relay_fetched(after);
             return;
         }
@@ -4904,17 +4900,11 @@ impl Host {
         let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
         let copy_queue = f.queue.clone();
         let waiting = std::time::Instant::now();
-        // The flights the fetch runs behind: those in the line by now have
-        // been given to the queue. On the copy queue, those landed here.
-        let ahead = match copy_queue {
-            Some(_) => 0,
-            None => line().target,
-        };
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
         // event are this thread's.
         let ran = unsafe {
-            (|| -> windows::core::Result<u64> {
+            (|| -> windows::core::Result<(u64, u64)> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
                 for (shadow, lo, hi, at) in check.as_ref().map_or(&pieces, |c| &c.copies) {
@@ -4924,6 +4914,25 @@ impl Host {
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 let _fetching = crate::timeline::span("landing: fetching pieces");
                 if let Some(queue) = &copy_queue {
+                    // Cross-queue: Wait for every graphics submission already
+                    // signalled on the host fence before the copy engine reads
+                    // the same card buffers. Without this, AMD's driver has
+                    // crashed in amdxc64 (null this at +0x861b9f) and NVIDIA
+                    // has device-removed with INVALID_CALL (0x887A0001) —
+                    // concurrent write+read across queue type classes is
+                    // illegal, and copy-queue access needs COMMON decay.
+                    let mut graphics_done = line().target;
+                    loop {
+                        if graphics_done > 0 {
+                            queue.Wait(&self.fence, graphics_done)?;
+                        }
+                        let now = line().target;
+                        if now <= graphics_done {
+                            break;
+                        }
+                        graphics_done = now;
+                    }
+                    let after_sends = *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
                     queue.ExecuteCommandLists(&lists);
                     queue.Signal(&fence, sent)?;
                     meanwhile();
@@ -4931,10 +4940,11 @@ impl Host {
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(None);
                     WaitForSingleObject(event, INFINITE);
-                    return Ok(behind);
+                    return Ok((graphics_done, after_sends));
                 }
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
+                let ahead = line().target;
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
                 self.queue.ExecuteCommandLists(&lists);
                 let after = *order;
@@ -4946,11 +4956,11 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(None);
                 WaitForSingleObject(event, INFINITE);
-                Ok(after)
+                Ok((ahead, after))
             })()
         };
-        let after = match ran {
-            Ok(after) => after,
+        let (ahead, after) = match ran {
+            Ok(pair) => pair,
             Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
         };
         let us = waiting.elapsed().as_micros() as u64;
@@ -8933,6 +8943,10 @@ struct Meter {
     copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
+    /// First present (when this meter was made).
+    boot_at: std::time::Instant,
+    /// One-shot: still ≤20 draws/frame 30s after first present.
+    boot_stall_warned: bool,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
 }
@@ -8947,6 +8961,8 @@ impl Meter {
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
+            boot_at: now,
+            boot_stall_warned: false,
             caption: None,
         }
     }
@@ -9198,6 +9214,21 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            if !self.boot_stall_warned
+                && draws <= 20.0
+                && self.boot_at.elapsed() >= std::time::Duration::from_secs(30)
+            {
+                self.boot_stall_warned = true;
+                let (made, loaded, started_early) = crate::pipeline::library_counts();
+                tracing::warn!(
+                    draws,
+                    made,
+                    loaded,
+                    started_early,
+                    making = crate::pipeline::making(),
+                    "boot still at low draws after 30s; world packs may not have opened (cold pipeline library?)"
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 let put = [0, 1, 2, 3].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);

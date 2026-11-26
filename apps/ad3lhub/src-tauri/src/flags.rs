@@ -278,11 +278,11 @@ pub fn catalog() -> Vec<FlagDef> {
         FlagDef {
             key: "RELAY_COPY",
             label: "Relay on copy queue",
-            help: "Run relay copies on the card copy queue.",
+            help: "Off by default: fetching card buffers on the copy queue without a graphics-fence Wait removed NVIDIA devices (0x887A0001) and crashed AMD (amdxc64 null). Safe again only on builds that Wait before the copy.",
             category: "Performance",
             kind: FlagKind::Toggle,
             choices: &[],
-            default: "1",
+            default: "0",
             expert: true,
         },
         FlagDef {
@@ -626,7 +626,7 @@ pub fn preset_flags(id: &str) -> BTreeMap<String, String> {
             set(&mut m, "WIDE_MERGE", "1");
             set(&mut m, "JOIN_COPIES", "1");
             set(&mut m, "INDIRECT_WINDOW", "1");
-            set(&mut m, "RELAY_COPY", "1");
+            // RELAY_COPY left off: unfixed builds device-remove / amdxc64-crash on it.
             set(&mut m, "CARD_STEPS", "2");
             set(&mut m, "INDIRECT_BATCH", "2");
             set(&mut m, "MAP_THREADS", "1");
@@ -657,7 +657,7 @@ pub fn preset_flags(id: &str) -> BTreeMap<String, String> {
             set(&mut m, "LEVELS_ON_DEMAND", "1");
             set(&mut m, "TEXTURE_NO_WAIT", "1");
             set(&mut m, "RELAY", "2");
-            set(&mut m, "RELAY_COPY", "1");
+            // RELAY_COPY left off (see FlagDef help / host.rs Wait fix).
             set(&mut m, "WIDE_BACK", "1");
             set(&mut m, "WIDE_MERGE", "1");
             set(&mut m, "JOIN_COPIES", "1");

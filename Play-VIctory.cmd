@@ -34,7 +34,10 @@ if not defined VICTORY_CARD_REHASH_RUNS set "VICTORY_CARD_REHASH_RUNS=1"
 if not defined VICTORY_WIDE_MERGE set "VICTORY_WIDE_MERGE=1"
 if not defined VICTORY_JOIN_COPIES set "VICTORY_JOIN_COPIES=1"
 if not defined VICTORY_INDIRECT_WINDOW set "VICTORY_INDIRECT_WINDOW=1"
-if not defined VICTORY_RELAY_COPY set "VICTORY_RELAY_COPY=1"
+rem RELAY_COPY off by default: copy-queue fetch without a graphics-fence Wait
+rem device-removed NVIDIA (0x887A0001) and crashed AMD (amdxc64). Re-enable
+rem only on builds that Wait in host.rs relay_card_back.
+if not defined VICTORY_RELAY_COPY set "VICTORY_RELAY_COPY=0"
 if not defined VICTORY_CARD_STEPS set "VICTORY_CARD_STEPS=2"
 if not defined VICTORY_INDIRECT_BATCH set "VICTORY_INDIRECT_BATCH=2"
 if not defined VICTORY_MAP_THREADS set "VICTORY_MAP_THREADS=1"

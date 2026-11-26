@@ -468,6 +468,17 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Host pipelines made, loaded from the library, and started early at creation.
+#[cfg(windows)]
+pub(crate) fn library_counts() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        library::MADE.load(Ordering::Relaxed),
+        library::LOADED.load(Ordering::Relaxed),
+        library::EARLY.load(Ordering::Relaxed),
+    )
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
