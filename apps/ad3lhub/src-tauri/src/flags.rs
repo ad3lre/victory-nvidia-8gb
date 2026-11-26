@@ -538,11 +538,11 @@ pub fn catalog() -> Vec<FlagDef> {
         FlagDef {
             key: "D3D12_DRED",
             label: "DRED breadcrumbs",
-            help: "empty off; light = which list died; 1 = full (diagnostics builds).",
+            help: "empty off; light = which list died; 1 = full markers (default).",
             category: "Diagnostics",
             kind: FlagKind::Choice,
             choices: &["", "light", "1", "faults"],
-            default: "light",
+            default: "1",
             expert: true,
         },
     ]
@@ -649,7 +649,7 @@ pub fn preset_flags(id: &str) -> BTreeMap<String, String> {
             set(&mut m, "LEVELS_ON_DEMAND", "1");
             set(&mut m, "CARD_BUFFERS_MIN_KB", "64");
             set(&mut m, "LOG", "victory_gpu=info,victory_telemetry=info,warn");
-            set(&mut m, "D3D12_DRED", "light");
+            set(&mut m, "D3D12_DRED", "1");
             set(&mut m, "D3D12_DEBUG", "1");
             set(&mut m, "TEXTURE_DROP_MIPS", "2");
             set(&mut m, "NULL_COLOR", "grey");
@@ -687,7 +687,7 @@ pub fn preset_flags(id: &str) -> BTreeMap<String, String> {
             set(&mut m, "OVERLAY", "1");
             set(&mut m, "TELEMETRY", "1");
             set(&mut m, "LOG", "victory_gpu=info,victory_telemetry=info,warn");
-            set(&mut m, "D3D12_DRED", "light");
+            set(&mut m, "D3D12_DRED", "1");
             set(&mut m, "D3D12_DEBUG", "1");
         }
     }

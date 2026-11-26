@@ -18,7 +18,7 @@ $settings = @{
     # 0x887A0001 device-removed / AMD amdxc64 null). Re-enable only with the Wait fix.
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '0'; VICTORY_CARD_STEPS = '2'
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '1'
-    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'; VICTORY_SKIP_PIPELINES = 'none'
+    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = '1'; VICTORY_SKIP_PIPELINES = 'none'
     # Observability: name INVALID_CALL on device-removed; keep GPU trail through boot.
     VICTORY_D3D12_DEBUG = '1'; VICTORY_TRAIL = '1'
     VICTORY_LOG = 'victory_gpu=info,victory_telemetry=info,warn'

@@ -76,8 +76,8 @@ opt-level = 2
 debug = "line-tables-only"
 lto = "thin"
 
-# The development build: release code generation plus the `diagnostics`
-# feature (`cargo build --profile diag -p victory --features diagnostics`),
-# kept in its own folder so it does not evict the plain release build.
+# Development build folder (release codegen). `diagnostics` is now the
+# default victory feature; `--features diagnostics` is still fine / explicit.
+# Kept separate so it does not evict a plain `--no-default-features` release.
 [profile.diag]
 inherits = "release"

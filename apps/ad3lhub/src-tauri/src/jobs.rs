@@ -197,7 +197,19 @@ pub fn install(app: &AppHandle, job: &SharedJob, p: &Project) -> Result<(), Stri
     let profile = detect_build_profile(&dir);
     let has_lockfile = dir.join("Cargo.lock").is_file();
     let mut cargo = tools::cargo();
-    cargo.args(["build", "--profile", profile, "-p", "victory", "--target-dir"]);
+    // Full diagnostics is the default victory feature (debug layer / DRED /
+    // crash naming). Pass it explicitly so older checkouts without
+    // `default = ["diagnostics"]` still get a diagnostics binary.
+    cargo.args([
+        "build",
+        "--profile",
+        profile,
+        "-p",
+        "victory",
+        "--features",
+        "diagnostics",
+        "--target-dir",
+    ]);
     cargo.arg(&target);
     if has_lockfile {
         cargo.arg("--locked");

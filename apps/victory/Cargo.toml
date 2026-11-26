@@ -28,8 +28,9 @@ ureq = "2.12.1"
 zip = { version = "2.2.3", default-features = false, features = ["deflate"] }
 
 [features]
-# Debug-level logs and the debugging switches (frame capture, stack dumps,
-# the host debug layer, scripted keys). Off in a plain release build.
+# Full debug mode is the default: debug-layer / DRED naming on device-removed,
+# frame capture, stack dumps, scripted keys. Opt out with --no-default-features.
+default = ["diagnostics"]
 diagnostics = [
     "victory-core/diagnostics",
     "victory-hle/diagnostics",

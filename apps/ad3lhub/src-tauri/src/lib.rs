@@ -658,6 +658,15 @@ mod tests {
     }
 
     #[test]
+    fn launch_presets_default_to_full_dred_and_debug() {
+        for id in ["ad3l-balanced", "pareto"] {
+            let flags = preset_flags(id);
+            assert_eq!(flags.get("D3D12_DRED").map(String::as_str), Some("1"), "{id}");
+            assert_eq!(flags.get("D3D12_DEBUG").map(String::as_str), Some("1"), "{id}");
+        }
+    }
+
+    #[test]
     fn warm_pipelines_defaults_on_for_new_and_legacy_settings() {
         assert!(Settings::default().warm_pipelines);
         // Minimal saved settings (camelCase): omit warmPipelines → default true.
