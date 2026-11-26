@@ -325,7 +325,7 @@ fn run_agent(session_path: &Path) -> Result<(), String> {
     // fast TDR must not win the race before we take our own handles (which
     // keep the objects alive after the game dies).
     let mut last = String::new();
-    for attempt in 1..=30 {
+    for attempt in 1..=30u32 {
         match metrics::open_shared(&session.shm_name) {
             Ok(()) => {
                 last.clear();
@@ -343,7 +343,7 @@ fn run_agent(session_path: &Path) -> Result<(), String> {
     let stop = {
         let mut opened = None;
         let mut last = String::new();
-        for attempt in 1..=30 {
+        for attempt in 1..=30u32 {
             match windows::StopEvent::open(&session.stop_event) {
                 Ok(event) => {
                     opened = Some(event);
@@ -617,7 +617,7 @@ fn make_ingest_bundle(
     fork: &Json,
     manifest: &Json,
     samples: &[Sample],
-    /// When set, only these samples are sent and the server appends them.
+    // When set, only these samples are sent and the server appends them.
     partial: bool,
 ) -> Json {
     let summary = summary::compute(samples);
@@ -1073,8 +1073,6 @@ fn record(options: Options, ids: RecordIds, stop: StopSource) {
         }
         if !ingest_ok("/vi/v1/ingest", &bundle.to_string(), Some(tok), "ingest") {
             upload_notes.push("ingest failed after retries".into());
-        } else {
-            ingested = true;
         }
         flush_pending_screenshots(
             &id,

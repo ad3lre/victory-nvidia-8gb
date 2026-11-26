@@ -2,6 +2,9 @@
 //! ranges, how often, of what memory) and what limits their rate, logged
 //! with the frame-rate line. `VICTORY_COPY_MODE=plain` copies without the
 //! mapped-page guard, `none` skips the copies (both for timing only).
+// Built without `diagnostics` too, for the always-on frame-budget telemetry;
+// most counters here are only read by the diagnostics build.
+#![cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -514,6 +517,7 @@ pub(crate) fn process_memory() -> (u64, u64) {
 
 /// The PC's memory in bytes: physical memory free, and what is left to
 /// commit.
+#[cfg(feature = "diagnostics")]
 fn system_memory() -> (u64, u64) {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
@@ -527,6 +531,7 @@ fn system_memory() -> (u64, u64) {
 /// Whether the address space is walked for the memory map line
 /// ([`log_memory_map`]). On by default (this module is in diagnostics
 /// builds only); `VICTORY_MEMORY_MAP=0` leaves the walk out.
+#[cfg(feature = "diagnostics")]
 fn memory_map() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_MAP").is_none_or(|v| v != "0"))
@@ -534,6 +539,7 @@ fn memory_map() -> bool {
 
 /// Asks which of the pages in `asked` (address, answer) are in physical
 /// memory and adds the bytes each stands for (kind, bytes) to its kind.
+#[cfg(feature = "diagnostics")]
 fn in_memory(asked: &mut Vec<[usize; 2]>, stands: &mut Vec<(usize, u64)>, present: &mut [u64; 10]) {
     use windows_sys::Win32::System::ProcessStatus::K32QueryWorkingSetEx;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -568,6 +574,7 @@ fn in_memory(asked: &mut Vec<[usize; 2]>, stands: &mut Vec<(usize, u64)>, presen
 /// query of a region of gigabytes holds up other threads' memory calls
 /// for its length (89 ms for the 6.2 GB pool), so it runs with every
 /// sixth memory line only.
+#[cfg(feature = "diagnostics")]
 fn log_memory_map() {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_WRITECOMBINE,
@@ -719,6 +726,7 @@ fn log_memory_map() {
 
 /// Logs where the memory is: the process and the PC, then what this crate
 /// holds by kind (alive now), then the host buffers made since the start.
+#[cfg(feature = "diagnostics")]
 fn log_memory() {
     use std::sync::atomic::Ordering::Relaxed;
     let mb = |v: u64| v as f64 / (1 << 20) as f64;
@@ -1436,6 +1444,7 @@ pub(crate) fn log(frames: f64) {
         .map(|r| format!("thread {} {:.0} ms in {:.0} calls", r.0, r.1 as f64 / 1e6 / frames, r.2 as f64 / frames))
         .collect();
     tracing::info!("  list calls by thread: {} threads; {}", recorders.len(), busiest.join(", "));
+    #[cfg(feature = "diagnostics")]
     log_memory();
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();

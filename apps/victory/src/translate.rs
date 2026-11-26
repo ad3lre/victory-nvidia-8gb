@@ -294,7 +294,7 @@ pub fn run(
         .iter()
         .flat_map(|root| walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok))
         .filter(|entry| {
-            entry.file_type().is_file() && entry.metadata().map_or(false, |m| m.len() <= MAX_FILE)
+            entry.file_type().is_file() && entry.metadata().is_ok_and(|m| m.len() <= MAX_FILE)
         })
         .map(|entry| entry.into_path())
         .collect();

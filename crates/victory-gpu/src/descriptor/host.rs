@@ -2994,7 +2994,7 @@ impl HostHeap {
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
         // RAW FirstElement is in dwords and must begin on 16 bytes.
-        if offset % 16 != 0 || len < 4 {
+        if !offset.is_multiple_of(16) || len < 4 {
             tracing::warn!(offset, len, "raw unordered view not 16-byte aligned left null");
             self.null_raw_uav_at(index);
             return;
@@ -4157,7 +4157,7 @@ fn twin_uav(
     // A stencil plane's twin (R8 typeless 60, or already typed R8 61/62):
     // the title's view is of the stencil plane if it names plane 1 or a
     // stencil view format (22, 47). PlaneSlice must be 0 on the twin.
-    if matches!(d.Format.0, 60 | 61 | 62) {
+    if matches!(d.Format.0, 60..=62) {
         let plane = take_uav_plane(&mut desc);
         if plane != 1 && !matches!(desc.Format.0, 22 | 47) {
             return None;

@@ -533,7 +533,8 @@ impl Default for Timeouts {
 }
 
 struct SharedHttp {
-    session: *mut c_void,
+    // Kept open for the process lifetime; `connect` is derived from it.
+    _session: *mut c_void,
     connect: *mut c_void,
 }
 
@@ -566,7 +567,7 @@ fn shared_http() -> Result<std::sync::MutexGuard<'static, Option<SharedHttp>>, S
                 WinHttpCloseHandle(session);
                 return Err("WinHttpConnect failed".into());
             }
-            *slot = Some(SharedHttp { session, connect });
+            *slot = Some(SharedHttp { _session: session, connect });
         }
     }
     Ok(slot)
