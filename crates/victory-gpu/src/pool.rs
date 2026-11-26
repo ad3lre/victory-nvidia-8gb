@@ -194,6 +194,14 @@ impl Ranges {
         Ranges(BTreeMap::from([(0, size)]))
     }
 
+    /// Whether `len` bytes at a multiple of `align` fit somewhere.
+    fn fits(&self, len: u64, align: u64) -> bool {
+        self.0.iter().any(|(&start, &size)| {
+            let at = start.next_multiple_of(align);
+            at + len <= start + size
+        })
+    }
+
     /// The lowest place for `len` bytes at a multiple of `align`.
     fn take(&mut self, len: u64, align: u64) -> Option<u64> {
         let (start, size, at) = self.0.iter().find_map(|(&start, &size)| {
@@ -309,11 +317,20 @@ impl<B: Clone> Pool<B> {
             }
         }
         if found.is_none() && ripe.ahead > 0 {
-            // The one that has been there the longest.
-            let mut unripe: Vec<(u64, usize)> =
-                self.blocks.iter().enumerate().filter_map(|(i, b)| Some((b.as_ref()?.made, i))).collect();
-            unripe.sort_unstable();
-            found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
+            // Oldest block that still has room (one pass; no sort+alloc).
+            let mut best: Option<(u64, usize)> = None;
+            for (i, block) in self.blocks.iter().enumerate() {
+                let Some(block) = block else { continue };
+                if !block.free.fits(len, align) {
+                    continue;
+                }
+                if best.is_none_or(|(made, _)| block.made < made) {
+                    best = Some((block.made, i));
+                }
+            }
+            if let Some((_, i)) = best {
+                found = Some((i, self.blocks[i].as_mut()?.free.take(len, align)?));
+            }
         }
         // A failed 64 MiB block must not trigger another driver call for each
         // small texture. Existing free ranges remain usable during backoff.

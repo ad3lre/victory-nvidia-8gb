@@ -4,17 +4,24 @@
 `victory run --execute`. It is **on by default** so frame-rate regressions can
 be compared between builds and machines. Reports go to
 `https://rxnd.de/vi/v1`; local files are written before upload, so a network
-failure leaves the recorded data available locally. Hardware/title metadata is
-sent with the opening ping, and FPS samples are ingested about every sixty
-seconds during the run (and again at exit) so a GPU TDR that kills the process
-still leaves charts and system info on the collector. Transient failures are
-retried a few times; anything still pending stays on disk
-(`upload-status-<run_id>.txt` notes incomplete uploads).
+failure leaves the recorded data available locally.
+
+On Windows the recorder runs as a **sibling process** (the same `victory`
+executable re-entered with `VICTORY_TELEMETRY_AGENT` pointing at a session
+JSON under the telemetry directory). The game only publishes one-second FPS
+windows into a named shared-memory ring and signals a named stop event on a
+clean exit. The agent owns registration, ping, mid-run and final ingest,
+screenshots, and log uploads, and keeps running after a GPU TDR or hard kill
+of the game. If the agent cannot be spawned, an in-process thread is used as
+a fallback. Hardware/title metadata rides on the opening ping; FPS samples
+are ingested about every sixty seconds and again when the agent finishes.
+Transient failures are retried a few times; anything still pending stays on
+disk (`upload-status-<run_id>.txt` notes incomplete uploads).
 
 ## Opting out
 
 Any one of these turns it off completely (no registration, no ping, no upload,
-no recorder thread, no screenshots):
+no agent, no screenshots):
 
 ```powershell
 $env:VICTORY_TELEMETRY = '0'          # environment, highest precedence
@@ -122,6 +129,8 @@ contains:
 - `NOTICE.txt` — the first-run disclosure and opt-out instructions;
 - `token` — this installation's bearer token;
 - `machine_id` — the installation ID associated with that token;
+- `agent-<run_id>.json` — session hand-off for the sibling recorder (paths,
+  game PID, shared-memory and stop-event names);
 - `manifest-<run_id>.json`, `samples-<run_id>.jsonl`, `summary-<run_id>.json`
   — one set per run, kept even when the upload fails;
 - `screenshots-<run_id>/NNN.jpg` — local copies of the bounded game-window

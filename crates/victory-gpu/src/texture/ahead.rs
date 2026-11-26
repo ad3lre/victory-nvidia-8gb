@@ -12,9 +12,9 @@
 //! (a copy queue's copies leave it there), from which the card's shaders read
 //! it as any texture.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
@@ -79,7 +79,8 @@ pub(crate) enum Taken {
 
 static QUEUE: (Mutex<VecDeque<Arc<Job>>>, Condvar) = (Mutex::new(VecDeque::new()), Condvar::new());
 /// Those on their way, by host copy ([`HostTexture::serial`]).
-static ON_THEIR_WAY: Mutex<Vec<(u64, Arc<Job>)>> = Mutex::new(Vec::new());
+static ON_THEIR_WAY: LazyLock<Mutex<HashMap<u64, Arc<Job>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static LANDED: Condvar = Condvar::new();
 static BYTES: AtomicU64 = AtomicU64::new(0);
@@ -102,7 +103,7 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     let copy = crate::resource::host_copy(resource)?;
     if copy.ahead.load(Relaxed) == PENDING {
         let way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
-        return way.iter().find(|(serial, _)| *serial == copy.serial).map(|(_, job)| Taken::Known(job.clone()));
+        return way.get(&copy.serial).map(|job| Taken::Known(job.clone()));
     }
     // Speculative ahead uploads compete with submit prep for CPU and RAM;
     // under critical pressure they amplify multi-second stalls / TDR risk.
@@ -146,7 +147,7 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     BYTES.fetch_add(job.staging.read as u64, Relaxed);
     {
         let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
-        way.push((job.copy.serial, job.clone()));
+        way.insert(job.copy.serial, job.clone());
         IN_FLIGHT.store(way.len(), std::sync::atomic::Ordering::Release);
     }
     Some(Taken::New(job))
@@ -186,8 +187,11 @@ pub(crate) fn listed(copy: &HostTexture) {
     STATS[5].fetch_add(1, Relaxed);
     let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
     let started = std::time::Instant::now();
-    while way.iter().any(|(serial, _)| *serial == copy.serial) && started.elapsed().as_millis() < 1000 {
-        way = LANDED.wait_timeout(way, std::time::Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
+    while way.contains_key(&copy.serial) && started.elapsed().as_millis() < 1000 {
+        way = LANDED
+            .wait_timeout(way, std::time::Duration::from_millis(50))
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
     }
 }
 
@@ -350,8 +354,9 @@ fn finish(jobs: Vec<Arc<Job>>) {
     // Remove from `ON_THEIR_WAY` only after `job.then` callbacks have queued
     // their `FLIPS` entries so `drain()` observes every flip ready to apply.
     {
+        let done: HashSet<u64> = jobs.iter().map(|job| job.copy.serial).collect();
         let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
-        way.retain(|(serial, _)| !jobs.iter().any(|job| job.copy.serial == *serial));
+        way.retain(|serial, _| !done.contains(serial));
         IN_FLIGHT.store(way.len(), std::sync::atomic::Ordering::Release);
         LANDED.notify_all();
     }

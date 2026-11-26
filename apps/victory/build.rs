@@ -70,7 +70,25 @@ fn dll_ok(path: &Path) -> io::Result<bool> {
 }
 
 fn download_agility_dll() -> io::Result<Vec<u8>> {
+    const ATTEMPTS: u32 = 3;
+    let mut last = None;
+    for attempt in 1..=ATTEMPTS {
+        match download_agility_dll_once() {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => {
+                last = Some(error);
+                if attempt < ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(400 * u64::from(attempt)));
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::other("Agility download failed")))
+}
+
+fn download_agility_dll_once() -> io::Result<Vec<u8>> {
     let response = ureq::get(AGILITY_URL)
+        .timeout(std::time::Duration::from_secs(30))
         .call()
         .map_err(|error| io::Error::other(format!("download {AGILITY_URL}: {error}")))?;
     let mut nupkg = Vec::new();

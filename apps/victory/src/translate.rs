@@ -198,12 +198,27 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
                             let Some(bytes) = job.bytes() else {
                                 continue;
                             };
-                            let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+                            let container_hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
                             if limit.is_some_and(|n| began.elapsed().as_secs() >= n) {
                                 counts[3].fetch_add(1, Ordering::Relaxed);
                                 break;
                             }
-                            if (!all && !wanted.contains(&hash)) || !lock(&done).insert(hash) {
+                            // Log hashes name the container; dedup by DXIL
+                            // payload so wrappers of the same code warm once.
+                            if !all && !wanted.contains(&container_hash) {
+                                continue;
+                            }
+                            let Ok(container) = Container::parse(&bytes) else {
+                                continue;
+                            };
+                            let Some(dxil) = container
+                                .part(FourCC::DXIL)
+                                .or(container.part(FourCC::ACCC))
+                                .map(|p| p.data)
+                            else {
+                                continue;
+                            };
+                            if !lock(&done).insert(blake3::hash(dxil)) {
                                 continue;
                             }
                             let n = counts[4].fetch_add(1, Ordering::Relaxed) + 1;
@@ -275,44 +290,45 @@ pub fn run(
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
-    for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
-                continue;
-            }
-            let Ok(data) = std::fs::read(entry.path()) else {
-                continue;
-            };
-            let jobs = sources(&data);
-            let next = AtomicUsize::new(0);
-            std::thread::scope(|s| {
-                for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
-                        let mut t = Tally {
-                            list,
-                            ..Tally::default()
-                        };
-                        let mut checks = Checks {
-                            keep: (!pairs.is_empty()).then(|| kept.clone()),
-                            validator: validate
-                                .then(|| Validator::load(dll.as_deref()).ok())
-                                .flatten(),
-                            host: pipelines
-                                .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
-                                .flatten(),
-                        };
-                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, entry.path(), &seen, &mut t, &mut checks);
-                        }
-                        lock(&total).merge(t);
-                    });
+    let files: Vec<PathBuf> = paths
+        .iter()
+        .flat_map(|root| walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok))
+        .filter(|entry| {
+            entry.file_type().is_file() && entry.metadata().map_or(false, |m| m.len() <= MAX_FILE)
+        })
+        .map(|entry| entry.into_path())
+        .collect();
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..threads.max(1).min(files.len().max(1)) {
+            s.spawn(|| {
+                let mut t = Tally {
+                    list,
+                    ..Tally::default()
+                };
+                // One device / validator per worker for the whole walk — not
+                // once per scanned file.
+                let mut checks = Checks {
+                    keep: (!pairs.is_empty()).then(|| kept.clone()),
+                    validator: validate
+                        .then(|| Validator::load(dll.as_deref()).ok())
+                        .flatten(),
+                    host: pipelines
+                        .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
+                        .flatten(),
+                };
+                while let Some(path) = files.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    let Ok(data) = std::fs::read(path) else {
+                        continue;
+                    };
+                    for job in sources(&data) {
+                        translate(&job, path, &seen, &mut t, &mut checks);
+                    }
                 }
+                lock(&total).merge(t);
             });
         }
-    }
+    });
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
     println!(
         "containers   {} ({} duplicates skipped)",

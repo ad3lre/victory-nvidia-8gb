@@ -180,17 +180,21 @@ impl NativeProgram {
     /// The code with each render target's export patched for its full
     /// 32-bit format, so exports carry the shader's values unconverted (as
     /// the console does at pipeline creation for that format).
-    pub fn patched_code(&self) -> Vec<u8> {
+    pub fn patched_code(&self) -> std::borrow::Cow<'_, [u8]> {
+        let StageIo::Ps { patches, .. } = &self.io else {
+            return std::borrow::Cow::Borrowed(&self.code);
+        };
+        if patches.is_empty() {
+            return std::borrow::Cow::Borrowed(&self.code);
+        }
         let mut code = self.code.clone();
-        if let StageIo::Ps { patches, .. } = &self.io {
-            for p in patches {
-                let at = p.offset as usize * 4;
-                for (i, word) in p.code.iter().enumerate() {
-                    code[at + 4 * i..at + 4 * i + 4].copy_from_slice(&word.to_le_bytes());
-                }
+        for p in patches {
+            let at = p.offset as usize * 4;
+            for (i, word) in p.code.iter().enumerate() {
+                code[at + 4 * i..at + 4 * i + 4].copy_from_slice(&word.to_le_bytes());
             }
         }
-        code
+        std::borrow::Cow::Owned(code)
     }
 }
 

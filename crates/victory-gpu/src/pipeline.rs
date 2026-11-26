@@ -60,6 +60,8 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
+    /// Full content digest (avoids re-hashing `container` in known.note).
+    pub(crate) digest: [u8; 32],
     container: Vec<u8>,
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
@@ -113,6 +115,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
+                digest: *full.as_bytes(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),

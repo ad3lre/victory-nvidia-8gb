@@ -174,6 +174,11 @@ enum Console {
 
 fn main() -> Result<()> {
     victory_core::logging::init("info");
+    // Sibling telemetry agent: re-entered with VICTORY_TELEMETRY_AGENT set.
+    #[cfg(windows)]
+    if victory_telemetry::agent_main() {
+        return Ok(());
+    }
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {

@@ -377,7 +377,7 @@ pub(crate) fn trim() {
     {
         return;
     }
-    let quiet_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let quiet_ms = crate::host::ram_idle_ms(crate::residency::physical_free());
     if crate::host::now_ms() < LOADED_AT.load(Ordering::Relaxed) + quiet_ms
         || TRIMMED.swap(true, Ordering::Relaxed)
     {

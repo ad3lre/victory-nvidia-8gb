@@ -9,6 +9,12 @@
 //! end of the run. Failed uploads are retried; local copies are always kept.
 //! No game packages, usernames, or network addresses are collected; log text
 //! is redacted on the server.
+//!
+//! On Windows the recorder prefers a **sibling agent process** (a re-entry of
+//! the same `victory` executable) so uploads survive GPU TDRs that kill the
+//! game. Shared memory carries FPS samples; a named event asks the agent to
+//! finish on a clean exit. If the agent cannot be spawned, an in-process
+//! thread is used as a fallback.
 
 // On non-Windows hosts only the portable maths and tests are compiled: there
 // is no recorder to call them, so the Windows-side plumbing is intentionally
@@ -22,7 +28,7 @@ mod summary;
 #[cfg(windows)]
 mod windows;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -32,6 +38,15 @@ use summary::Sample;
 
 /// Where reports are published. The only network destination in the crate.
 pub const ENDPOINT: &str = "https://rxnd.de/vi/v1";
+
+/// Env var naming the agent session JSON; set on the sibling process only.
+#[cfg(windows)]
+const AGENT_ENV: &str = "VICTORY_TELEMETRY_AGENT";
+
+/// How long a clean exit waits for the agent before returning (agent may keep
+/// uploading after the game process is gone).
+#[cfg(windows)]
+const FINISH_WAIT: Duration = Duration::from_secs(5);
 
 /// Everything the recorder needs that the app knows and the host does not.
 #[derive(Clone, Debug)]
@@ -49,22 +64,62 @@ pub struct Options {
     pub log_roots: Vec<PathBuf>,
 }
 
-/// Owns the recorder thread. `finish` joins it so the final bundle is written;
-/// dropping it does the same, which covers early returns on the run path.
+/// Owns the recorder (sidecar agent or in-process fallback). `finish` asks it
+/// to flush; dropping does the same for early returns on the run path.
 pub struct Run {
-    stop: Option<Sender<()>>,
-    thread: Option<JoinHandle<()>>,
+    #[cfg(windows)]
+    inner: RunInner,
+    #[cfg(not(windows))]
+    _private: (),
+}
+
+#[cfg(windows)]
+enum RunInner {
+    Thread {
+        stop: Option<Sender<()>>,
+        thread: Option<JoinHandle<()>>,
+    },
+    Agent {
+        child: Option<std::process::Child>,
+        stop_event: Option<windows::StopEvent>,
+    },
 }
 
 impl Run {
     pub fn finish(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(thread) = self.thread.take()
-            && thread.join().is_err()
-        {
-            tracing::warn!("telemetry recorder thread panicked");
+        #[cfg(windows)]
+        match &mut self.inner {
+            RunInner::Thread { stop, thread } => {
+                if let Some(stop) = stop.take() {
+                    let _ = stop.send(());
+                }
+                if let Some(thread) = thread.take()
+                    && thread.join().is_err()
+                {
+                    tracing::warn!("telemetry recorder thread panicked");
+                }
+            }
+            RunInner::Agent { child, stop_event } => {
+                if let Some(event) = stop_event.take() {
+                    event.signal();
+                }
+                if let Some(mut child) = child.take() {
+                    let deadline = Instant::now() + FINISH_WAIT;
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) if Instant::now() < deadline => {
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                            Ok(None) | Err(_) => {
+                                // Leave the agent running; it finalizes when
+                                // this process exits (or already saw the event).
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -77,20 +132,22 @@ impl Drop for Run {
 
 /// Starts one recorder for this process. Returns `None` when opted out or when
 /// the recorder could not start; telemetry must never fail a game launch.
+/// Prefers a sibling agent process; falls back to an in-process thread.
 #[cfg(windows)]
 pub fn start(options: Options) -> Option<Run> {
     if options.disabled || !enabled() {
         return None;
     }
-    let (stop, rx) = mpsc::channel();
-    let thread = std::thread::Builder::new()
-        .name("victory-telemetry".into())
-        .spawn(move || record(options, rx))
-        .ok()?;
-    Some(Run {
-        stop: Some(stop),
-        thread: Some(thread),
-    })
+    match spawn_agent(&options) {
+        Ok(run) => Some(run),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "telemetry agent spawn failed; falling back to in-process recorder"
+            );
+            start_in_process(options)
+        }
+    }
 }
 
 /// Non-Windows builds have no host to measure: still compile the maths/tests,
@@ -100,8 +157,259 @@ pub fn start(_options: Options) -> Option<Run> {
     None
 }
 
+/// Sibling-agent entry: when `VICTORY_TELEMETRY_AGENT` names a session file,
+/// run the recorder until the game exits and return `true`. Otherwise `false`
+/// so the normal CLI can continue.
+#[cfg(windows)]
+pub fn agent_main() -> bool {
+    let Some(path) = std::env::var_os(AGENT_ENV) else {
+        return false;
+    };
+    // SAFETY: single-threaded at process start; clear so we never re-enter.
+    unsafe { std::env::remove_var(AGENT_ENV) };
+    if let Err(error) = run_agent(Path::new(&path)) {
+        tracing::warn!(error = %error, "telemetry agent stopped");
+    }
+    true
+}
+
+#[cfg(not(windows))]
+pub fn agent_main() -> bool {
+    false
+}
+
 fn enabled() -> bool {
-    std::env::var_os("VICTORY_TELEMETRY").is_none_or(|v| v.to_str().is_none_or(|s| s != "0"))
+    match std::env::var_os("VICTORY_TELEMETRY") {
+        None => true,
+        Some(value) => !matches!(value.to_str(), Some("0" | "false" | "False" | "FALSE")),
+    }
+}
+
+#[cfg(windows)]
+fn start_in_process(options: Options) -> Option<Run> {
+    let game_pid = std::process::id();
+    let id = run_id();
+    let started = iso_utc();
+    let (stop, rx) = mpsc::channel();
+    let thread = std::thread::Builder::new()
+        .name("victory-telemetry".into())
+        .spawn(move || {
+            record(
+                options,
+                RecordIds {
+                    run_id: id,
+                    started,
+                    game_pid,
+                },
+                StopSource::Channel(rx),
+            );
+        })
+        .ok()?;
+    Some(Run {
+        inner: RunInner::Thread {
+            stop: Some(stop),
+            thread: Some(thread),
+        },
+    })
+}
+
+#[cfg(windows)]
+fn spawn_agent(options: &Options) -> Result<Run, String> {
+    let game_pid = std::process::id();
+    let id = run_id();
+    let started = iso_utc();
+    let shm_name = windows::metrics_mapping_name(game_pid);
+    let stop_name = windows::stop_event_name(&id);
+    metrics::create_shared(&shm_name)?;
+    let stop_event = windows::StopEvent::create(&stop_name)?;
+    let session_path = options.dir.join(format!("agent-{id}.json"));
+    write_session(
+        &session_path,
+        &Session {
+            run_id: id.clone(),
+            game_pid,
+            dir: options.dir.clone(),
+            title_hash: options.title_hash.clone(),
+            console: options.console.clone(),
+            started_at: started,
+            shm_name,
+            stop_event: stop_name,
+            log_roots: options.log_roots.clone(),
+        },
+    )?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let child = std::process::Command::new(exe)
+        .env(AGENT_ENV, &session_path)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    tracing::info!(run = %id, pid = child.id(), "telemetry agent started");
+    Ok(Run {
+        inner: RunInner::Agent {
+            child: Some(child),
+            stop_event: Some(stop_event),
+        },
+    })
+}
+
+#[cfg(windows)]
+struct Session {
+    run_id: String,
+    game_pid: u32,
+    dir: PathBuf,
+    title_hash: String,
+    console: String,
+    started_at: String,
+    shm_name: String,
+    stop_event: String,
+    log_roots: Vec<PathBuf>,
+}
+
+#[cfg(windows)]
+fn write_session(path: &Path, session: &Session) -> Result<(), String> {
+    let roots = session
+        .log_roots
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = Json::Obj(vec![
+        ("run_id", Json::string(&session.run_id)),
+        ("game_pid", Json::string(session.game_pid.to_string())),
+        ("dir", Json::string(session.dir.to_string_lossy())),
+        ("title_hash", Json::string(&session.title_hash)),
+        ("console", Json::string(&session.console)),
+        ("started_at", Json::string(&session.started_at)),
+        ("shm_name", Json::string(&session.shm_name)),
+        ("stop_event", Json::string(&session.stop_event)),
+        ("log_roots", Json::string(roots)),
+    ])
+    .to_string();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(path, body).map_err(|e| e.to_string())
+}
+
+#[cfg(windows)]
+fn read_session(path: &Path) -> Result<Session, String> {
+    let body = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let require = |key: &str| {
+        json::find_string(&body, key).ok_or_else(|| format!("session missing {key}"))
+    };
+    let game_pid = require("game_pid")?
+        .parse::<u32>()
+        .map_err(|_| "session game_pid is not a u32".to_string())?;
+    let log_roots = require("log_roots")?
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    Ok(Session {
+        run_id: require("run_id")?,
+        game_pid,
+        dir: PathBuf::from(require("dir")?),
+        title_hash: require("title_hash")?,
+        console: require("console")?,
+        started_at: require("started_at")?,
+        shm_name: require("shm_name")?,
+        stop_event: require("stop_event")?,
+        log_roots,
+    })
+}
+
+#[cfg(windows)]
+fn run_agent(session_path: &Path) -> Result<(), String> {
+    let session = read_session(session_path)?;
+    // Retry briefly: the game creates the mapping/event then spawns us; a
+    // fast TDR must not win the race before we take our own handles (which
+    // keep the objects alive after the game dies).
+    let mut last = String::new();
+    for attempt in 1..=30 {
+        match metrics::open_shared(&session.shm_name) {
+            Ok(()) => {
+                last.clear();
+                break;
+            }
+            Err(error) => {
+                last = error;
+                std::thread::sleep(Duration::from_millis(50 * u64::from(attempt.min(10))));
+            }
+        }
+    }
+    if !last.is_empty() {
+        return Err(last);
+    }
+    let stop = {
+        let mut opened = None;
+        let mut last = String::new();
+        for attempt in 1..=30 {
+            match windows::StopEvent::open(&session.stop_event) {
+                Ok(event) => {
+                    opened = Some(event);
+                    break;
+                }
+                Err(error) => {
+                    last = error;
+                    std::thread::sleep(Duration::from_millis(50 * u64::from(attempt.min(10))));
+                }
+            }
+        }
+        opened.ok_or(last)?
+    };
+    let game = windows::ProcessWatch::open(session.game_pid)?;
+    let options = Options {
+        dir: session.dir,
+        title_hash: session.title_hash,
+        console: session.console,
+        disabled: false,
+        log_roots: session.log_roots,
+    };
+    record(
+        options,
+        RecordIds {
+            run_id: session.run_id,
+            started: session.started_at,
+            game_pid: session.game_pid,
+        },
+        StopSource::Agent { game, stop },
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+struct RecordIds {
+    run_id: String,
+    started: String,
+    game_pid: u32,
+}
+
+#[cfg(windows)]
+enum StopSource {
+    Channel(Receiver<()>),
+    Agent {
+        game: windows::ProcessWatch,
+        stop: windows::StopEvent,
+    },
+}
+
+#[cfg(windows)]
+impl StopSource {
+    /// Wait briefly; returns true when the recorder should stop.
+    fn wait_tick(&self) -> bool {
+        match self {
+            Self::Channel(rx) => match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => true,
+                Err(mpsc::RecvTimeoutError::Timeout) => false,
+            },
+            Self::Agent { game, stop } => {
+                if stop.is_signaled() || game.is_exited() {
+                    return true;
+                }
+                let _ = game.wait_ms(100);
+                stop.is_signaled() || game.is_exited()
+            }
+        }
+    }
 }
 
 fn unix_seconds() -> u64 {
@@ -154,7 +462,8 @@ fn notice(dir: &std::path::Path) {
     let _ = std::fs::write(
         path,
         "adel VIctory sends anonymous performance reports to https://rxnd.de/vi \
-         so frame-rate regressions can be compared across builds. Reports contain \
+         so frame-rate regressions can be compared across builds. A sibling \
+         recorder process keeps uploading if the game crashes. Reports contain \
          PC specs, driver versions, screen size, temperatures where available, \
          the exact FPS timeline, heavily compressed game-window screenshots every \
          ten seconds for the first twenty minutes, and bounded Victory/title crash \
@@ -279,9 +588,11 @@ fn make_ingest_bundle(
     fork: &Json,
     manifest: &Json,
     samples: &[Sample],
+    /// When set, only these samples are sent and the server appends them.
+    partial: bool,
 ) -> Json {
     let summary = summary::compute(samples);
-    Json::Obj(vec![
+    let mut fields = vec![
         ("schema", Json::Int(1)),
         ("run_id", Json::string(id)),
         ("machine_id", Json::string(machine_id)),
@@ -294,12 +605,31 @@ fn make_ingest_bundle(
         ),
         ("events", Json::Arr(vec![])),
         ("summary", summary.to_json()),
-    ])
+    ];
+    if partial {
+        fields.push(("mode", Json::string("partial")));
+    }
+    Json::Obj(fields)
 }
 
 #[cfg(windows)]
 fn post_jpeg_ok(path: &str, jpeg: &[u8], token: &str, what: &str) -> bool {
+    post_jpeg_ok_until(path, jpeg, token, what, None)
+}
+
+#[cfg(windows)]
+fn post_jpeg_ok_until(
+    path: &str,
+    jpeg: &[u8],
+    token: &str,
+    what: &str,
+    deadline: Option<Instant>,
+) -> bool {
     for attempt in 1..=UPLOAD_ATTEMPTS {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            tracing::warn!(what, "telemetry screenshot upload skipped; flush deadline passed");
+            return false;
+        }
         match windows::post_jpeg(path, jpeg, token) {
             Ok((status, _)) if http_ok(status) => return true,
             Ok((status, response)) => {
@@ -379,6 +709,7 @@ fn shot_name(slot: u8) -> String {
 fn maybe_capture_screenshot(
     dir: &std::path::Path,
     run_id: &str,
+    game_pid: u32,
     token: Option<&str>,
     elapsed: Duration,
     next_slot: &mut u8,
@@ -390,8 +721,8 @@ fn maybe_capture_screenshot(
     if slot < *next_slot {
         return;
     }
-    *next_slot = slot.saturating_add(1);
-    let Some(jpeg) = windows::capture_game_jpeg() else {
+    let Some(jpeg) = windows::capture_game_jpeg(game_pid) else {
+        // Keep the slot open so alt-tab / black swapchain can retry.
         return;
     };
     let name = shot_name(slot);
@@ -401,6 +732,7 @@ fn maybe_capture_screenshot(
     if std::fs::write(&path, &jpeg).is_err() {
         return;
     }
+    *next_slot = slot.saturating_add(1);
     let Some(token) = token else {
         pending.push((name, path));
         return;
@@ -433,7 +765,7 @@ fn flush_pending_screenshots(
             continue;
         };
         let remote = format!("/vi/v1/runs/{run_id}/screenshots/{name}");
-        if post_jpeg_ok(&remote, &jpeg, token, name) {
+        if post_jpeg_ok_until(&remote, &jpeg, token, name, Some(deadline)) {
             pending.remove(i);
         } else {
             i += 1;
@@ -443,7 +775,7 @@ fn flush_pending_screenshots(
 }
 
 #[cfg(windows)]
-fn record(options: Options, stop: Receiver<()>) {
+fn record(options: Options, ids: RecordIds, stop: StopSource) {
     let dir = options.dir;
     notice(&dir);
     // Older installs derived this ID from CPUID, which can vary with the
@@ -464,8 +796,9 @@ fn record(options: Options, stop: Receiver<()>) {
         id
     });
     let mut token = load_token(&dir, &machine_id);
-    let id = run_id();
-    let started = iso_utc();
+    let id = ids.run_id;
+    let started = ids.started;
+    let game_pid = ids.game_pid;
     let specs = windows::specs();
     let (width, height) = windows::display();
     let fork = Json::Obj(vec![
@@ -494,6 +827,10 @@ fn record(options: Options, stop: Receiver<()>) {
                 ("name", Json::string(specs.gpu_name)),
                 ("driver", Json::string(specs.gpu_driver)),
                 ("vram_mb", Json::Int(specs.vram_mb)),
+                (
+                    "temp_note",
+                    Json::string("NVAPI temperature reader not enabled in v1"),
+                ),
             ]),
         ),
         (
@@ -544,7 +881,7 @@ fn record(options: Options, stop: Receiver<()>) {
         pinged = post_ok("/vi/v1/ping", &ping.to_string(), Some(tok), "ping");
         // Empty-sample ingest publishes hardware immediately and creates the
         // completed-run row the dashboard charts from.
-        let early = make_ingest_bundle(&id, &machine_id, &started, &fork, &manifest, &[]);
+        let early = make_ingest_bundle(&id, &machine_id, &started, &fork, &manifest, &[], false);
         ingested = ingest_ok("/vi/v1/ingest", &early.to_string(), Some(tok), "ingest-early");
     }
 
@@ -567,6 +904,7 @@ fn record(options: Options, stop: Receiver<()>) {
     maybe_capture_screenshot(
         &dir,
         &id,
+        game_pid,
         token.as_deref(),
         Duration::ZERO,
         &mut next_shot,
@@ -577,9 +915,8 @@ fn record(options: Options, stop: Receiver<()>) {
     let mut last_ingest = Instant::now();
     let mut last_ingest_len = 0usize;
     loop {
-        match stop.recv_timeout(Duration::from_millis(100)) {
-            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        if stop.wait_tick() {
+            break;
         }
         if token.is_none() && last_token_retry.elapsed() >= Duration::from_secs(45) {
             ensure_token(&dir, &machine_id, &mut token);
@@ -592,13 +929,14 @@ fn record(options: Options, stop: Receiver<()>) {
             if !ingested
                 && let Some(tok) = token.as_deref()
             {
-                let early = make_ingest_bundle(&id, &machine_id, &started, &fork, &manifest, &[]);
+                let early = make_ingest_bundle(&id, &machine_id, &started, &fork, &manifest, &[], false);
                 ingested = ingest_ok("/vi/v1/ingest", &early.to_string(), Some(tok), "ingest-early");
             }
         }
         maybe_capture_screenshot(
             &dir,
             &id,
+            game_pid,
             token.as_deref(),
             began.elapsed(),
             &mut next_shot,
@@ -631,8 +969,16 @@ fn record(options: Options, stop: Receiver<()>) {
             && samples.len() > last_ingest_len
             && let Some(tok) = token.as_deref()
         {
-            let bundle =
-                make_ingest_bundle(&id, &machine_id, &started, &fork, &manifest, &samples);
+            let fresh = &samples[last_ingest_len..];
+            let bundle = make_ingest_bundle(
+                &id,
+                &machine_id,
+                &started,
+                &fork,
+                &manifest,
+                fresh,
+                true,
+            );
             if ingest_ok("/vi/v1/ingest", &bundle.to_string(), Some(tok), "ingest-partial") {
                 ingested = true;
                 last_ingest_len = samples.len();
@@ -640,7 +986,7 @@ fn record(options: Options, stop: Receiver<()>) {
             last_ingest = Instant::now();
         }
         let windows = metrics::drain(&mut cursor);
-        let (cpu_pct, gpu_pct, ram_mb) = windows::rates();
+        let (cpu_pct, gpu_pct, ram_mb) = windows::rates(game_pid);
         let (cpu_temp_c, cpu_temp_reason, gpu_temp_c, gpu_temp_reason) = windows::temperatures();
         for metrics in windows {
             let sample = Sample {
@@ -675,7 +1021,7 @@ fn record(options: Options, stop: Receiver<()>) {
         dir.join(format!("summary-{id}.json")),
         summary.to_json().to_string(),
     );
-    let bundle = make_ingest_bundle(&id, &machine_id, &started, &fork, &manifest, &samples);
+    let bundle = make_ingest_bundle(&id, &machine_id, &started, &fork, &manifest, &samples, false);
     ensure_token(&dir, &machine_id, &mut token);
     let mut upload_notes = Vec::new();
     if let Some(tok) = token.as_deref() {
@@ -811,5 +1157,32 @@ mod tests {
         assert_eq!(screenshot_slot(Duration::from_secs(1200)), None);
         assert_eq!(shot_name(1), "001.jpg");
         assert_eq!(shot_name(120), "120.jpg");
+    }
+
+    #[test]
+    fn session_json_round_trips_string_fields() {
+        let roots = ["/tmp/a", "/tmp/b"].join("\n");
+        let body = Json::Obj(vec![
+            ("run_id", Json::string("20261126120000-abcd")),
+            ("game_pid", Json::string("4242")),
+            ("dir", Json::string(r"C:\Users\me\telemetry")),
+            ("title_hash", Json::string("deadbeef")),
+            ("console", Json::string("Xbox Series X")),
+            ("started_at", Json::string("2026-11-26T12:00:00Z")),
+            ("shm_name", Json::string(r"Local\VictoryTelemMetrics-4242")),
+            ("stop_event", Json::string(r"Local\VictoryTelemStop-20261126120000-abcd")),
+            ("log_roots", Json::string(roots)),
+        ])
+        .to_string();
+        assert_eq!(
+            json::find_string(&body, "game_pid").as_deref(),
+            Some("4242")
+        );
+        assert_eq!(
+            json::find_string(&body, "dir").as_deref(),
+            Some(r"C:\Users\me\telemetry")
+        );
+        let roots = json::find_string(&body, "log_roots").unwrap();
+        assert_eq!(roots.lines().count(), 2);
     }
 }

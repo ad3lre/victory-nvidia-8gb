@@ -27,7 +27,7 @@ const FIRST: u32 = 16;
 /// [`ir::build`] of `native`'s code as the hardware runs it, with the loads
 /// of a spilled user-data table rewritten ([`user_data`]).
 pub fn build(native: &NativeProgram) -> Result<Program, ShaderError> {
-    let mut p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let mut p = ir::build(native.patched_code().as_ref(), native.wave64, native.vgprs)?;
     user_data(&mut p, native);
     Ok(p)
 }

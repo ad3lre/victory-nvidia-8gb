@@ -285,15 +285,22 @@ pub unsafe fn apply(name: &str, base: usize, size: usize, list: &str) -> usize {
 /// # Safety
 /// As [`apply`].
 pub unsafe fn apply_asked(name: &str, base: usize, size: usize) {
-    let Some(file) = std::env::var_os("VICTORY_WRITE_SITES") else {
-        return;
-    };
-    let Ok(list) = std::fs::read_to_string(Path::new(&file)) else {
+    let Some(list) = sites_list() else {
         return;
     };
     // SAFETY: by the caller.
-    let places = unsafe { apply(name, base, size, &list) };
+    let places = unsafe { apply(name, base, size, list) };
     tracing::info!(image = name, places, "writes of the title's that look first (VICTORY_WRITE_SITES)");
+}
+
+fn sites_list() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static LIST: OnceLock<Option<String>> = OnceLock::new();
+    LIST.get_or_init(|| {
+        let file = std::env::var_os("VICTORY_WRITE_SITES")?;
+        std::fs::read_to_string(Path::new(&file)).ok()
+    })
+    .as_deref()
 }
 
 #[cfg(test)]

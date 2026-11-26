@@ -10,7 +10,7 @@
 //! are ignored anyway).
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
@@ -106,10 +106,17 @@ pub(crate) fn translation() -> [u8; 32] {
 /// can do decides the form of some programs.
 pub fn precompile(container: &[u8]) -> Result<bool, String> {
     let _ = crate::host::host();
-    let misses = MISSES.load(Ordering::Relaxed);
-    host_shader(container)?;
-    // (Counts other threads' misses too: the caller only adds them up.)
-    Ok(MISSES.load(Ordering::Relaxed) == misses)
+    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    match CACHE.get() {
+        Some(cache) => {
+            let (_shader, miss) = cached(cache, &build(), container, translate)?;
+            Ok(!miss)
+        }
+        None => {
+            translate(container)?;
+            Ok(false)
+        }
+    }
 }
 
 /// The translation of a console shader container, from the cache when
@@ -117,16 +124,18 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate),
+        Some(cache) => cached(cache, &build(), container, translate).map(|(s, _)| s),
         None => translate(container),
     }
 }
 
 /// The cache entry's converter: the build and the container in, the
-/// encoded translation out. `ran` tells a miss from a hit.
+/// encoded translation out. `ran` tells a miss from a hit; `last` keeps
+/// the encoded bytes so a miss need not re-read the file it just wrote.
 struct Translate<F> {
     translate: F,
     ran: AtomicBool,
+    last: Mutex<Option<Vec<u8>>>,
 }
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
@@ -140,7 +149,9 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
         let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader))
+        let bytes = encode(&shader);
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(bytes.clone());
+        Ok(bytes)
     }
 }
 
@@ -149,31 +160,48 @@ fn cached(
     build: &[u8; 32],
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
-) -> Result<HostShader, String> {
-    let input = [&build[..], container].concat();
+) -> Result<(HostShader, bool), String> {
+    let mut input = Vec::with_capacity(build.len() + container.len());
+    input.extend_from_slice(build);
+    input.extend_from_slice(container);
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
+        last: Mutex::new(None),
     };
     for _ in 0..2 {
         let path = cache
             .get_or_convert(&converter, &input)
             .map_err(|e| format!("{e:#}"))?;
-        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
-            let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
+        let miss = converter.ran.load(Ordering::Relaxed);
+        let decoded = if miss {
+            converter
+                .last
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .and_then(|b| decode(&b))
+        } else {
+            None
+        };
+        let shader = decoded.or_else(|| std::fs::read(&path).ok().and_then(|b| decode(&b)));
+        if let Some(shader) = shader {
+            let (counter, what) = if miss {
                 (&MISSES, "translated and cached")
             } else {
                 (&HITS, "from the cache")
             };
             counter.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(path = %path.display(), "shader {what}");
-            return Ok(shader);
+            return Ok((shader, miss));
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
+        converter.ran.store(false, Ordering::Relaxed);
+        *converter.last.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
-    (converter.translate)(container)
+    Ok(((converter.translate)(container)?, true))
 }
 
 const MAGIC: &[u8; 4] = b"VSH1";

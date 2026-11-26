@@ -279,11 +279,25 @@ fn learn(rip: usize, same: bool, can_look: bool) {
             return;
         };
         use std::io::Write;
-        let line = format!("{image} {offset:x}\n");
-        let known = std::fs::read_to_string(&file).unwrap_or_default();
-        if known.lines().any(|l| l.starts_with(line.trim_end())) {
-            return;
+        use std::sync::{Mutex, OnceLock};
+        static KNOWN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+        let key = format!("{image} {offset:x}");
+        let known = KNOWN.get_or_init(|| {
+            let mut set = std::collections::HashSet::new();
+            if let Ok(text) = std::fs::read_to_string(&file) {
+                for line in text.lines() {
+                    set.insert(line.trim_end().to_owned());
+                }
+            }
+            Mutex::new(set)
+        });
+        {
+            let mut known = known.lock().unwrap_or_else(|e| e.into_inner());
+            if !known.insert(key.clone()) {
+                return;
+            }
         }
+        let line = format!("{key}\n");
         if let Ok(mut file) = std::fs::OpenOptions::new().append(true).create(true).open(&file) {
             let _ = file.write_all(line.as_bytes());
         }

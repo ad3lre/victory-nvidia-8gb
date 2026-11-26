@@ -21,7 +21,8 @@ test_titles = []
 [telemetry]
 # Anonymous performance reports are ON by default so FPS regressions can be
 # compared across builds. Reports go to https://rxnd.de/vi/v1; local copies
-# are kept in <data_dir>/telemetry. Includes heavily compressed game-window
+# are kept in <data_dir>/telemetry. On Windows a sibling recorder process
+# keeps uploading if the game crashes. Includes heavily compressed game-window
 # JPEGs every 10s for the first 20 minutes. See docs/telemetry.md for exactly
 # what is sent. Turn them off here, with VICTORY_TELEMETRY=0, or `victory run
 # --no-telemetry` (the CLI and environment take precedence over this file).

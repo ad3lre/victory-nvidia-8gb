@@ -51,8 +51,9 @@ See the [performance comparison and test plan](docs/NVIDIA-INTEGRATION.md).
 
 Every run sends an anonymous performance report (PC specs, driver versions,
 fps timeline) to `https://rxnd.de/vi/v1` so regressions can be compared between
-builds; local copies stay in `%LOCALAPPDATA%\victory\data\telemetry`. It is on
-by default and can be disabled with `VICTORY_TELEMETRY=0`, `[telemetry]
+builds; local copies stay in `%LOCALAPPDATA%\victory\data\telemetry`. On
+Windows a sibling recorder process keeps uploading if the game crashes. It is
+on by default and can be disabled with `VICTORY_TELEMETRY=0`, `[telemetry]
 enabled = false` in `victory.toml`, or `victory run --no-telemetry`. See
 [docs/telemetry.md](docs/telemetry.md) for exactly what is collected.
 

@@ -726,7 +726,8 @@ impl<'a> Lanes<'a> {
                     self.joins[j].derived,
                 );
                 let mut failed = false;
-                for (n, a) in self.joins[j].args.clone().into_iter().enumerate() {
+                let join_args = self.joins[j].args.clone();
+                for (n, a) in join_args.into_iter().enumerate() {
                     let (q, taken) = self.incoming[block][n];
                     let e = self.edge(cond[q], q, taken);
                     let (mut m, d) = self.mask(a);
@@ -749,7 +750,8 @@ impl<'a> Lanes<'a> {
             }
             while p < self.phi_joins.len() {
                 let (id, was_derived) = (self.phi_joins[p].id, self.phi_joins[p].derived);
-                for a in self.phi_joins[p].args.clone() {
+                let phi_args = self.phi_joins[p].args.clone();
+                for a in phi_args {
                     let (_, d) = self.mask(a);
                     if !was_derived
                         && d

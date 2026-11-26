@@ -4,7 +4,9 @@
 use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
-use windows_sys::Win32::Foundation::{FILETIME, HWND, RECT};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, FILETIME, HANDLE, HWND, RECT, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
     DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, HDC, ReleaseDC, SRCCOPY, SelectObject,
@@ -17,7 +19,10 @@ use windows_sys::Win32::System::Registry::*;
 use windows_sys::Win32::System::SystemInformation::{
     GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, GetSystemTimes};
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, GetCurrentProcess, GetCurrentProcessId, GetSystemTimes, OpenEventW,
+    OpenProcess, PROCESS_SYNCHRONIZE, SetEvent, WaitForSingleObject,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId,
     IsWindowVisible, PW_RENDERFULLCONTENT, SM_CXSCREEN, SM_CYSCREEN,
@@ -269,8 +274,9 @@ static CPU: OnceLock<Mutex<CpuTimes>> = OnceLock::new();
 static GPU_3D: OnceLock<Option<PdhCounter>> = OnceLock::new();
 static THERMAL: OnceLock<Option<PdhCounter>> = OnceLock::new();
 
-/// CPU/GPU load and the process's working set, sampled once a second.
-pub fn rates() -> (Option<f64>, Option<f64>, Option<f64>) {
+/// CPU/GPU load and a process working set, sampled once a second.
+/// `target_pid` is the game process (the sidecar agent is a different PID).
+pub fn rates(target_pid: u32) -> (Option<f64>, Option<f64>, Option<f64>) {
     let (idle, total) = cpu_times();
     let state = CPU.get_or_init(|| Mutex::new(CpuTimes(0, 0)));
     let cpu = if let Ok(mut last) = state.lock() {
@@ -292,17 +298,27 @@ pub fn rates() -> (Option<f64>, Option<f64>, Option<f64>) {
         .map(|values| values.into_iter().sum::<f64>().clamp(0.0, 100.0));
 
     let ram = unsafe {
-        let mut pm = std::mem::zeroed::<PROCESS_MEMORY_COUNTERS_EX>();
-        pm.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
-        if GetProcessMemoryInfo(
-            GetCurrentProcess(),
-            std::ptr::from_mut(&mut pm).cast(),
-            pm.cb,
-        ) == 0
-        {
+        // PROCESS_QUERY_LIMITED_INFORMATION is enough for GetProcessMemoryInfo.
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        let handle = if target_pid == GetCurrentProcessId() {
+            GetCurrentProcess()
+        } else {
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, target_pid)
+        };
+        if handle.is_null() {
             None
         } else {
-            Some(pm.WorkingSetSize as f64 / MB)
+            let mut pm = std::mem::zeroed::<PROCESS_MEMORY_COUNTERS_EX>();
+            pm.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+            let ok = GetProcessMemoryInfo(handle, std::ptr::from_mut(&mut pm).cast(), pm.cb);
+            if target_pid != GetCurrentProcessId() {
+                CloseHandle(handle);
+            }
+            if ok == 0 {
+                None
+            } else {
+                Some(pm.WorkingSetSize as f64 / MB)
+            }
         }
     };
     (cpu, gpu, ram)
@@ -334,11 +350,9 @@ pub fn temperatures() -> (Option<f64>, Option<String>, Option<f64>, Option<Strin
         Some(value) if value > -100.0 && value < 150.0 => (Some(value), None),
         _ => (None, Some("thermal zone sensor unavailable".to_owned())),
     };
-    let gpu = (
-        None,
-        Some("NVAPI temperature reader not enabled in v1".to_owned()),
-    );
-    (cpu.0, cpu.1, gpu.0, gpu.1)
+    // GPU temp reason is recorded once on the run manifest; omit the
+    // constant string from every sample row.
+    (cpu.0, cpu.1, None, None)
 }
 
 /// Primary monitor size in pixels.
@@ -457,6 +471,46 @@ impl Default for Timeouts {
     }
 }
 
+struct SharedHttp {
+    session: *mut c_void,
+    connect: *mut c_void,
+}
+
+// SAFETY: handles are only used while the Mutex guard is held.
+unsafe impl Send for SharedHttp {}
+
+fn shared_http() -> Result<std::sync::MutexGuard<'static, Option<SharedHttp>>, String> {
+    static HTTP: OnceLock<Mutex<Option<SharedHttp>>> = OnceLock::new();
+    let mut slot = HTTP
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if slot.is_none() {
+        let agent = wide("adel-VIctory-telemetry/1.0");
+        let host = wide("rxnd.de");
+        // SAFETY: WinHTTP session/connect opened once and kept for reuse.
+        unsafe {
+            let session = WinHttpOpen(
+                agent.as_ptr(),
+                WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            );
+            if session.is_null() {
+                return Err("WinHttpOpen failed".into());
+            }
+            let connect = WinHttpConnect(session, host.as_ptr(), 443, 0);
+            if connect.is_null() {
+                WinHttpCloseHandle(session);
+                return Err("WinHttpConnect failed".into());
+            }
+            *slot = Some(SharedHttp { session, connect });
+        }
+    }
+    Ok(slot)
+}
+
 fn request(
     method: &str,
     path: &str,
@@ -465,8 +519,7 @@ fn request(
     token: Option<&str>,
     timeouts: Timeouts,
 ) -> Result<(u16, String), String> {
-    let agent = wide("adel-VIctory-telemetry/1.0");
-    let host = wide("rxnd.de");
+    let len = u32::try_from(body.len()).map_err(|_| "body too large for WinHTTP".to_owned())?;
     let verb = wide(method);
     let resource = wide(path);
     let mut headers = format!("Content-Type: {content_type}\r\n");
@@ -477,25 +530,15 @@ fn request(
     }
     let headers = wide(&headers);
 
-    // SAFETY: every handle is checked before use and closed before return.
+    let held = shared_http()?;
+    let Some(http) = held.as_ref() else {
+        return Err("WinHTTP session missing".into());
+    };
+
+    // SAFETY: request handle is checked and closed before return; session/connect stay open.
     unsafe {
-        let session = WinHttpOpen(
-            agent.as_ptr(),
-            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-        );
-        if session.is_null() {
-            return Err("WinHttpOpen failed".into());
-        }
-        let connect = WinHttpConnect(session, host.as_ptr(), 443, 0);
-        if connect.is_null() {
-            WinHttpCloseHandle(session);
-            return Err("WinHttpConnect failed".into());
-        }
         let request = WinHttpOpenRequest(
-            connect,
+            http.connect,
             verb.as_ptr(),
             resource.as_ptr(),
             std::ptr::null(),
@@ -504,8 +547,6 @@ fn request(
             WINHTTP_FLAG_SECURE,
         );
         if request.is_null() {
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
             return Err("WinHttpOpenRequest failed".into());
         }
         WinHttpSetTimeouts(
@@ -520,21 +561,17 @@ fn request(
             headers.as_ptr(),
             u32::MAX,
             body.as_ptr().cast::<c_void>(),
-            body.len() as u32,
-            body.len() as u32,
+            len,
+            len,
             0,
         );
         if ok == 0 {
             WinHttpCloseHandle(request);
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
             return Err("WinHttpSendRequest failed".into());
         }
         let ok = WinHttpReceiveResponse(request, std::ptr::null_mut());
         if ok == 0 {
             WinHttpCloseHandle(request);
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
             return Err("WinHttpReceiveResponse failed".into());
         }
         let mut status = 0u32;
@@ -567,8 +604,6 @@ fn request(
             }
         }
         WinHttpCloseHandle(request);
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
         Ok((
             status as u16,
             String::from_utf8_lossy(&response).into_owned(),
@@ -576,9 +611,118 @@ fn request(
     }
 }
 
+/// Named auto-reset-style stop signal shared by the game and its telemetry agent.
+pub fn stop_event_name(run_id: &str) -> String {
+    format!("Local\\VictoryTelemStop-{run_id}")
+}
+
+/// Shared-memory name for the FPS ring mirrored to the sidecar agent.
+pub fn metrics_mapping_name(game_pid: u32) -> String {
+    format!("Local\\VictoryTelemMetrics-{game_pid}")
+}
+
+/// Owns a Windows event handle used to ask the sidecar to finish cleanly.
+pub struct StopEvent {
+    handle: HANDLE,
+}
+
+impl StopEvent {
+    /// Create the named event the sidecar waits on (game side).
+    pub fn create(name: &str) -> Result<Self, String> {
+        let name = wide(name);
+        // SAFETY: NUL-terminated name; manual-reset so a late waiter still sees it.
+        let handle = unsafe { CreateEventW(std::ptr::null(), 1, 0, name.as_ptr()) };
+        if handle.is_null() {
+            return Err("CreateEventW failed".into());
+        }
+        Ok(Self { handle })
+    }
+
+    /// Open an existing stop event (agent side).
+    pub fn open(name: &str) -> Result<Self, String> {
+        let name = wide(name);
+        // SYNCHRONIZE is enough to wait; 0x00100000 is the Win32 value.
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        // SAFETY: NUL-terminated name for an event created by the game.
+        let handle = unsafe { OpenEventW(SYNCHRONIZE, 0, name.as_ptr()) };
+        if handle.is_null() {
+            return Err("OpenEventW failed".into());
+        }
+        Ok(Self { handle })
+    }
+
+    pub fn signal(&self) {
+        // SAFETY: handle was created/opened by this type.
+        unsafe {
+            let _ = SetEvent(self.handle);
+        }
+    }
+
+    /// Returns true when the event is signaled.
+    pub fn is_signaled(&self) -> bool {
+        // SAFETY: handle was created/opened by this type.
+        unsafe { WaitForSingleObject(self.handle, 0) == WAIT_OBJECT_0 }
+    }
+}
+
+impl Drop for StopEvent {
+    fn drop(&mut self) {
+        // SAFETY: handle is exclusively owned.
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+// SAFETY: HANDLE is process-scoped and only used from the owning thread/agent.
+unsafe impl Send for StopEvent {}
+
+/// Watch a process for exit (agent waits until the game dies).
+pub struct ProcessWatch {
+    handle: HANDLE,
+}
+
+impl ProcessWatch {
+    pub fn open(pid: u32) -> Result<Self, String> {
+        // SAFETY: PROCESS_SYNCHRONIZE is enough for WaitForSingleObject.
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if handle.is_null() {
+            return Err(format!("OpenProcess({pid}) failed"));
+        }
+        Ok(Self { handle })
+    }
+
+    /// True when the process has exited (or the handle is already signaled).
+    pub fn is_exited(&self) -> bool {
+        // SAFETY: handle opened above.
+        unsafe { WaitForSingleObject(self.handle, 0) == WAIT_OBJECT_0 }
+    }
+
+    /// Wait up to `timeout_ms` for the process to exit. Returns true if exited.
+    pub fn wait_ms(&self, timeout_ms: u32) -> bool {
+        // SAFETY: handle opened above.
+        match unsafe { WaitForSingleObject(self.handle, timeout_ms) } {
+            WAIT_OBJECT_0 => true,
+            WAIT_TIMEOUT => false,
+            _ => true,
+        }
+    }
+}
+
+impl Drop for ProcessWatch {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+unsafe impl Send for ProcessWatch {}
+
 /// Captures the foreground game window as a heavily compressed JPEG.
-/// Returns `None` when the window is not ours, hidden, empty, or capture fails.
-pub fn capture_game_jpeg() -> Option<Vec<u8>> {
+/// Returns `None` when the window is not the target PID's, hidden, empty, or
+/// capture fails. Pass the game PID so a sibling agent can capture it.
+pub fn capture_game_jpeg(target_pid: u32) -> Option<Vec<u8>> {
     // SAFETY: window handles are queried and validated before use; GDI objects
     // created below are released on every exit path.
     unsafe {
@@ -588,7 +732,7 @@ pub fn capture_game_jpeg() -> Option<Vec<u8>> {
         }
         let mut owner = 0u32;
         GetWindowThreadProcessId(hwnd, &mut owner);
-        if owner != GetCurrentProcessId() {
+        if owner != target_pid {
             return None;
         }
         let mut rect = RECT {
