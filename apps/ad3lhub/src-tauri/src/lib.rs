@@ -54,7 +54,8 @@ pub struct Settings {
     #[serde(default)]
     pub always_rewarm: bool,
     /// Also run `victory translate --pipelines` after shaders (much slower; GPU-specific).
-    #[serde(default)]
+    /// On by default so first Play builds `host-pipelines.bin` and avoids the cold-boot hang.
+    #[serde(default = "default_true")]
     pub warm_pipelines: bool,
 }
 
@@ -91,7 +92,7 @@ impl Default for Settings {
             show_expert: false,
             warm_before_play: true,
             always_rewarm: false,
-            warm_pipelines: false,
+            warm_pipelines: true,
         }
     }
 }
@@ -607,4 +608,46 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running Ad3lHub");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warm_pipelines_defaults_on_for_new_and_legacy_settings() {
+        assert!(Settings::default().warm_pipelines);
+        // Minimal saved settings (camelCase): omit warmPipelines → default true.
+        let legacy: Settings = serde_json::from_str(
+            r#"{
+              "gameDir":"",
+              "defaultsSet":false,
+              "fullscreen":false,
+              "installDir":"",
+              "later":[],
+              "selected":null,
+              "custom":[],
+              "extraEnv":"",
+              "gpuFilter":0
+            }"#,
+        )
+        .unwrap();
+        assert!(legacy.warm_pipelines);
+        let off: Settings = serde_json::from_str(
+            r#"{
+              "gameDir":"",
+              "defaultsSet":false,
+              "fullscreen":false,
+              "installDir":"",
+              "later":[],
+              "selected":null,
+              "custom":[],
+              "extraEnv":"",
+              "gpuFilter":0,
+              "warmPipelines":false
+            }"#,
+        )
+        .unwrap();
+        assert!(!off.warm_pipelines);
+    }
 }
