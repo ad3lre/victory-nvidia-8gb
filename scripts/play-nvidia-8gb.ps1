@@ -15,6 +15,11 @@ if (-not (Test-Path -LiteralPath $runner -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) {
     throw "Title executable missing at $Exe."
 }
+$agilityInstaller = Join-Path $repoRoot 'scripts\install-agility-runtime.ps1'
+if (-not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $runner) 'D3D12\D3D12Core.dll') -PathType Leaf)) {
+    Write-Output 'Preparing the pinned Agility SDK 620 runtime required by older Windows D3D12 systems.'
+    & $agilityInstaller -OutputDirectory (Split-Path -Parent $runner)
+}
 if ($DropMips -gt 0) {
     Write-Warning 'This build uses mip residency on demand. The DropMips setting has no effect.'
 }

@@ -26,6 +26,30 @@ const ROOT_SIGNATURE_IIDS: [Iid; 3] = [
 ];
 
 const CONSOLE_FLAGS: u32 = 0xff00_0000;
+const D3D12_ERROR_INVALID_REDIST: u32 = 0x887e_0003;
+
+fn agility_redist_error(hr: HRESULT) -> bool {
+    hr as u32 == D3D12_ERROR_INVALID_REDIST
+}
+
+fn report_agility_redist_error(hr: HRESULT) {
+    if !agility_redist_error(hr) {
+        return;
+    }
+    let runtime_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|parent| parent.join("D3D12")))
+        .map_or_else(
+            || "<executable directory>\\D3D12".into(),
+            |path| path.display().to_string(),
+        );
+    tracing::error!(
+        hresult = format_args!("{:#010x}", hr as u32),
+        requested_sdk = 620,
+        runtime_dir,
+        "D3D12 rejected the Agility SDK runtime (missing or mismatched D3D12Core.dll); install Microsoft.Direct3D.D3D12 1.620.2 x64 into this directory"
+    );
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -108,14 +132,16 @@ pub extern "system" fn serialize(
         return E_NOTIMPL;
     };
     // SAFETY: the export has this signature; it takes what the title passed.
-    unsafe {
+    let hr = unsafe {
         std::mem::transmute::<usize, Serialize>(address)(
             &without_console_flags(desc),
             version,
             blob,
             error,
         )
-    }
+    };
+    report_agility_redist_error(hr);
+    hr
 }
 
 /// `d3d12_xs!D3D12SerializeVersionedRootSignature`.
@@ -138,7 +164,10 @@ pub extern "system" fn serialize_versioned(
         ..desc
     };
     // SAFETY: the export has this signature; it takes what the title passed.
-    unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) }
+    let hr =
+        unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) };
+    report_agility_redist_error(hr);
+    hr
 }
 
 type Deserialize =
@@ -295,6 +324,13 @@ mod tests {
             E_INVALIDARG
         );
         assert!(blob.is_null() && error.is_null());
+    }
+
+    #[test]
+    fn invalid_redist_hresult_is_identified_without_relabeling_other_errors() {
+        assert!(agility_redist_error(D3D12_ERROR_INVALID_REDIST as i32));
+        assert!(!agility_redist_error(E_INVALIDARG));
+        assert_eq!(D3D12_ERROR_INVALID_REDIST, 0x887e_0003);
     }
 
     /// A null `riid` used to be forwarded to the host, which dereferences it

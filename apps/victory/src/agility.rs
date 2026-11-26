@@ -5,8 +5,10 @@
 //! which every translated pipeline uses. D3D12 looks for these two exports on
 //! the process's executable; when they name a runtime newer than the
 //! system's, it loads `D3D12Core.dll` from `D3D12SDKPath` (relative to the
-//! executable) instead. Place the matching DLL there when required. Without the
-//! folder, or on a system whose runtime is newer, the in-box one is used.
+//! executable) instead. Place the matching DLL there when required. If the
+//! system runtime is older than 620 and the app-local DLL is absent or has a
+//! different SDK version, device creation fails with
+//! `D3D12_ERROR_INVALID_REDIST` (`0x887e0003`).
 //!
 //! `build.rs` exports both symbols.
 #![allow(non_upper_case_globals)]

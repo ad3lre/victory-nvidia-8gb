@@ -5,7 +5,23 @@
 The integration retains the NVIDIA fork's D3D12 Agility SDK 620 exports.
 For the Windows 11 21H2 setup used with the GTX 1660, place the x64
 `D3D12Core.dll` from Microsoft.Direct3D.D3D12 version 1.620.2 in the
-`D3D12` directory next to the executable. See the
+`D3D12` directory next to the executable. The NVIDIA launcher now fetches
+and SHA-512 verifies that pinned NuGet package when the app-local runtime is
+missing. To prepare it manually after building, run:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-agility-runtime.ps1 -OutputDirectory .\target\release
+```
+
+If the log reports `0x887E0003` (`D3D12_ERROR_INVALID_REDIST`), the runtime is
+missing, outside the configured `D3D12` subfolder, or mismatched with SDK 620.
+Replace a stale app-local runtime with:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-agility-runtime.ps1 -OutputDirectory .\target\release -Force
+```
+
+The matching `D3D12Core.dll` must be under the executable's `D3D12` folder. See the
 [GTX 1660 test notes](docs/HARDWARE-GTX1660.md) for the previous build results.
 
 ## Run the pareto-residency profile
