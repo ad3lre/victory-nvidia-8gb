@@ -1,5 +1,9 @@
 # Adel's VIctory NVIDIA 8 GB
 
+## Ad3lHub
+
+Leo-styled Windows launcher for this fork and other VIctory projects: see [`apps/ad3lhub`](apps/ad3lhub). Tag `ad3lhub-v*` to publish a GitHub Release build.
+
 ## Older Windows D3D12 runtimes
 
 The integration retains the NVIDIA fork's D3D12 Agility SDK 620 exports.

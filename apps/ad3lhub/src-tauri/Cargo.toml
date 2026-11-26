@@ -1,0 +1,36 @@
+[package]
+name = "ad3lhub"
+version = "0.1.0"
+description = "Ad3lHub: Leo-styled launcher for VIctory-based projects"
+authors = ["Ad3l"]
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[lib]
+name = "ad3lhub_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-process = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2.10", features = ["json"] }
+parking_lot = "0.12"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_Graphics_Gdi",
+] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true
