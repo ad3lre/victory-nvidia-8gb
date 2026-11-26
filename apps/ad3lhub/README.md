@@ -6,6 +6,7 @@ No game files are included or downloaded. You need your own copy of the game.
 
 ## Features
 
+- Single home view (no tabs): featured hero, game/tools strip, community list; settings, activity log, and add-repo as modals
 - Featured install/play for `ad3lre/victory-nvidia-8gb`
 - Live PortWatch project list, custom GitHub links
 - Install / update / uninstall (repos, build targets, shader cache; saves kept)
@@ -15,6 +16,7 @@ No game files are included or downloaded. You need your own copy of the game.
 - **Shader warm** (AnyXboxX-style): `victory shaders` on game `.rpf` archives before Play, with a fingerprint marker so later launches skip when the build/flags/archives are unchanged; optional host pipeline prebuild
 - Detect Git / Rust / MSVC; install missing tools with winget
 - Update checks on start and every 15 minutes
+- Resilient boot (featured shows before PortWatch), throttled job log streaming, shallow-fetch deepen + cargo `--locked` retry on update/install
 
 ## Requirements
 

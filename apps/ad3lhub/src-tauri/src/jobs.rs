@@ -12,7 +12,11 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
+
+/// Cap how often cargo/git line spam hits the webview (avoids freeze).
+const LOG_EMIT_MIN: Duration = Duration::from_millis(120);
 
 #[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,6 +35,7 @@ pub struct Job {
     pub stage: String,
     pub log: Vec<String>,
     pub failed: bool,
+    pub(crate) last_emit: Option<Instant>,
 }
 
 impl Job {
@@ -52,18 +57,38 @@ fn emit_job(app: &AppHandle, job: &SharedJob) {
     let _ = app.emit("job", &snap);
 }
 
+fn emit_job_throttled(app: &AppHandle, job: &SharedJob, force: bool) {
+    let should = {
+        let mut j = job.lock();
+        let now = Instant::now();
+        let due = force
+            || j.last_emit
+                .map(|t| now.duration_since(t) >= LOG_EMIT_MIN)
+                .unwrap_or(true);
+        if due {
+            j.last_emit = Some(now);
+            true
+        } else {
+            false
+        }
+    };
+    if should {
+        emit_job(app, job);
+    }
+}
+
 fn stage(app: &AppHandle, job: &SharedJob, s: &str) {
     {
         let mut j = job.lock();
         j.stage = s.to_string();
         j.log.push(format!("== {s}"));
     }
-    emit_job(app, job);
+    emit_job_throttled(app, job, true);
 }
 
 fn push_log(app: &AppHandle, job: &SharedJob, line: String) {
     job.lock().log.push(line);
-    emit_job(app, job);
+    emit_job_throttled(app, job, false);
 }
 
 pub fn run_cmd(app: &AppHandle, job: &SharedJob, c: &mut Command) -> Result<(), String> {
@@ -130,6 +155,146 @@ fn git_head(dir: &Path) -> Result<String, String> {
     Ok(hash)
 }
 
+fn git_fetch_update(app: &AppHandle, job: &SharedJob, p: &Project, dir: &Path) -> Result<(), String> {
+    match &p.branch {
+        Some(b) => {
+            let dst = format!("refs/remotes/origin/{b}");
+            let spec = format!("+refs/heads/{b}:{dst}");
+            let shallow = run_cmd(
+                app,
+                job,
+                tools::git()
+                    .args(["fetch", "--depth", "1", "origin", &spec])
+                    .current_dir(dir),
+            );
+            if shallow.is_err() {
+                push_log(
+                    app,
+                    job,
+                    "shallow fetch failed — deepening history and retrying".into(),
+                );
+                let _ = run_cmd(
+                    app,
+                    job,
+                    tools::git()
+                        .args(["fetch", "--unshallow", "origin"])
+                        .current_dir(dir),
+                );
+                run_cmd(
+                    app,
+                    job,
+                    tools::git()
+                        .args(["fetch", "origin", &spec])
+                        .current_dir(dir),
+                )?;
+            }
+            run_cmd(
+                app,
+                job,
+                tools::git()
+                    .args(["checkout", "-B", b, &format!("origin/{b}")])
+                    .current_dir(dir),
+            )?;
+        }
+        None => {
+            // Pin to the same OID `ls-remote HEAD` reports so update checks stay in sync.
+            let tip = crate::catalog::remote_head(p)
+                .ok_or_else(|| "could not resolve remote HEAD — check Git and network".to_string())?;
+            let shallow = run_cmd(
+                app,
+                job,
+                tools::git()
+                    .args(["fetch", "--depth", "1", "origin", &tip])
+                    .current_dir(dir),
+            );
+            if shallow.is_err() {
+                push_log(
+                    app,
+                    job,
+                    "shallow OID fetch failed — unshallowing and retrying".into(),
+                );
+                let _ = run_cmd(
+                    app,
+                    job,
+                    tools::git()
+                        .args(["fetch", "--unshallow", "origin"])
+                        .current_dir(dir),
+                );
+                run_cmd(
+                    app,
+                    job,
+                    tools::git()
+                        .args(["fetch", "origin", &tip])
+                        .current_dir(dir),
+                )?;
+            }
+            run_cmd(
+                app,
+                job,
+                tools::git()
+                    .args(["reset", "--hard", "FETCH_HEAD"])
+                    .current_dir(dir),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn cargo_build(app: &AppHandle, job: &SharedJob, dir: &Path, repo: &str) -> Result<(), String> {
+    let target = target_dir(repo);
+    let profile = detect_build_profile(dir);
+    let has_lockfile = dir.join("Cargo.lock").is_file();
+
+    let run_build = |locked: bool| -> Result<(), String> {
+        let mut cargo = tools::cargo();
+        // Full diagnostics is the default victory feature (debug layer / DRED /
+        // crash naming). Pass it explicitly so older checkouts without
+        // `default = ["diagnostics"]` still get a diagnostics binary.
+        cargo.args([
+            "build",
+            "--profile",
+            profile,
+            "-p",
+            "victory",
+            "--features",
+            "diagnostics",
+            "--target-dir",
+        ]);
+        cargo.arg(&target);
+        if locked {
+            cargo.arg("--locked");
+        }
+        cargo.current_dir(dir);
+        run_cmd(app, job, &mut cargo)
+    };
+
+    if has_lockfile {
+        match run_build(true) {
+            Ok(()) => {}
+            Err(e) => {
+                push_log(
+                    app,
+                    job,
+                    format!("cargo --locked failed ({e}); retrying without --locked"),
+                );
+                run_build(false).map_err(|e2| {
+                    format!(
+                        "cargo build failed (also without --locked): {e2}. \
+                         Ensure Rust + MSVC C++ tools are installed."
+                    )
+                })?;
+            }
+        }
+    } else {
+        run_build(false).map_err(|e| {
+            format!(
+                "cargo build failed: {e}. Ensure Rust + MSVC C++ tools are installed."
+            )
+        })?;
+    }
+    Ok(())
+}
+
 pub fn install(app: &AppHandle, job: &SharedJob, p: &Project) -> Result<(), String> {
     let ws = workspace();
     std::fs::create_dir_all(ws.join("repos"))
@@ -138,50 +303,7 @@ pub fn install(app: &AppHandle, job: &SharedJob, p: &Project) -> Result<(), Stri
     let url = format!("https://github.com/{}.git", p.repo);
     if dir.join(".git").is_dir() {
         stage(app, job, "Downloading the new version");
-        match &p.branch {
-            Some(b) => {
-                let dst = format!("refs/remotes/origin/{b}");
-                run_cmd(
-                    app,
-                    job,
-                    tools::git()
-                        .args([
-                            "fetch",
-                            "--depth",
-                            "1",
-                            "origin",
-                            &format!("+refs/heads/{b}:{dst}"),
-                        ])
-                        .current_dir(&dir),
-                )?;
-                run_cmd(
-                    app,
-                    job,
-                    tools::git()
-                        .args(["checkout", "-B", b, &format!("origin/{b}")])
-                        .current_dir(&dir),
-                )?;
-            }
-            None => {
-                // Pin to the same OID `ls-remote HEAD` reports so update checks stay in sync.
-                let tip = crate::catalog::remote_head(p)
-                    .ok_or_else(|| "could not resolve remote HEAD".to_string())?;
-                run_cmd(
-                    app,
-                    job,
-                    tools::git()
-                        .args(["fetch", "--depth", "1", "origin", &tip])
-                        .current_dir(&dir),
-                )?;
-                run_cmd(
-                    app,
-                    job,
-                    tools::git()
-                        .args(["reset", "--hard", "FETCH_HEAD"])
-                        .current_dir(&dir),
-                )?;
-            }
-        }
+        git_fetch_update(app, job, p, &dir)?;
     } else {
         stage(app, job, "Downloading the project");
         let mut c = tools::git();
@@ -190,35 +312,19 @@ pub fn install(app: &AppHandle, job: &SharedJob, p: &Project) -> Result<(), Stri
             c.args(["--branch", b]);
         }
         c.arg(&url).arg(&dir);
-        run_cmd(app, job, &mut c)?;
+        if let Err(e) = run_cmd(app, job, &mut c) {
+            // Partial clone left behind — clean and surface a clear error.
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(format!(
+                "git clone failed: {e}. Check network access to github.com and that Git is installed."
+            ));
+        }
     }
     stage(app, job, "Building (the first time takes several minutes)");
-    let target = target_dir(&p.repo);
-    let profile = detect_build_profile(&dir);
-    let has_lockfile = dir.join("Cargo.lock").is_file();
-    let mut cargo = tools::cargo();
-    // Full diagnostics is the default victory feature (debug layer / DRED /
-    // crash naming). Pass it explicitly so older checkouts without
-    // `default = ["diagnostics"]` still get a diagnostics binary.
-    cargo.args([
-        "build",
-        "--profile",
-        profile,
-        "-p",
-        "victory",
-        "--features",
-        "diagnostics",
-        "--target-dir",
-    ]);
-    cargo.arg(&target);
-    if has_lockfile {
-        cargo.arg("--locked");
-    }
-    cargo.current_dir(&dir);
-    run_cmd(app, job, &mut cargo)?;
+    cargo_build(app, job, &dir, &p.repo)?;
     if !built_exe(&p.repo).is_file() {
         return Err(format!(
-            "the build made no {}",
+            "the build made no {} — check the activity log for cargo errors",
             built_exe(&p.repo).display()
         ));
     }
@@ -229,6 +335,7 @@ pub fn install(app: &AppHandle, job: &SharedJob, p: &Project) -> Result<(), Stri
     std::fs::write(built_file(&p.repo), &recorded)
         .map_err(|e| format!("could not write built-from.txt: {e}"))?;
     push_log(app, job, format!("built from {recorded}"));
+    emit_job_throttled(app, job, true);
     Ok(())
 }
 
@@ -448,6 +555,20 @@ pub fn install_tools(app: &AppHandle, job: &SharedJob) -> Result<(), String> {
         c.args(&args);
         run_cmd(app, job, &mut c)?;
     }
-    tools::detect();
+    tools::invalidate();
+    let again = tools::detect();
+    if !again.ready() {
+        push_log(
+            app,
+            job,
+            format!(
+                "tools still incomplete after winget (git={} cargo={} msvc={}) — you may need to restart Ad3lHub",
+                again.git.is_some(),
+                again.cargo.is_some(),
+                again.msvc
+            ),
+        );
+    }
+    emit_job_throttled(app, job, true);
     Ok(())
 }

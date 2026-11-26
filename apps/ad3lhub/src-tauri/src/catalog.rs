@@ -114,6 +114,7 @@ pub fn featured_project() -> Project {
 pub fn fetch_portwatch() -> Result<Vec<Project>, String> {
     let body: serde_json::Value = ureq::get(PORTWATCH)
         .set("User-Agent", "ad3lhub")
+        .timeout(std::time::Duration::from_secs(12))
         .call()
         .map_err(|e| format!("PortWatch could not be reached: {e}"))?
         .into_json()

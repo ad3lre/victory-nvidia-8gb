@@ -1,9 +1,10 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import logo from "./assets/logo.png";
 import { AdvancedSettings } from "./components/AdvancedSettings";
+import { ConfirmModal } from "./components/ConfirmModal";
 import {
   IconAlert,
   IconCheck,
@@ -11,14 +12,15 @@ import {
   IconFlame,
   IconFolder,
   IconGear,
-  IconLibrary,
   IconPlay,
   IconRefresh,
   IconTerminal,
   IconUsers,
 } from "./components/Icons";
+import { Modal } from "./components/Modal";
 import { Titlebar } from "./components/Titlebar";
 import { UpdateNotice } from "./components/UpdateNotice";
+import { formatError } from "./lib/errors";
 import type {
   Catalog,
   FlagCatalog,
@@ -30,8 +32,6 @@ import type {
   Tools,
 } from "./types";
 
-type Page = "library" | "community" | "settings" | "log";
-
 const emptyJob: JobSnapshot = {
   running: false,
   repo: null,
@@ -40,8 +40,24 @@ const emptyJob: JobSnapshot = {
   failed: false,
 };
 
+const featuredFallback: Project = {
+  name: "Victory NVIDIA 8 GB",
+  repo: "ad3lre/victory-nvidia-8gb",
+  branch: "main",
+  gpu: ["NVIDIA"],
+  fps: null,
+  render: null,
+  verified: true,
+  summary:
+    "Ad3l's NVIDIA 8 GB fork — telemetry, Agility SDK 620, Series S pareto-residency. Featured in Ad3lHub.",
+  custom: false,
+  localExe: null,
+  featured: true,
+};
+
+type ModalKind = "settings" | "activity" | "addRepo" | null;
+
 export default function App() {
-  const [page, setPage] = useState<Page>("library");
   const [settings, setSettings] = useState<Settings | null>(null);
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [tools, setTools] = useState<Tools | null>(null);
@@ -56,6 +72,11 @@ export default function App() {
   const [preview, setPreview] = useState<Record<string, string>>({});
   const [noticeRepo, setNoticeRepo] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
+  const [modal, setModal] = useState<ModalKind>(null);
+  const [confirmUninstall, setConfirmUninstall] = useState<Project | null>(null);
+  const [searchingGame, setSearchingGame] = useState(false);
+  const autoOpenedJob = useRef(false);
+  const checking = useRef(new Set<string>());
 
   const refreshCatalog = useCallback(async () => {
     const c = await invoke<Catalog>("fetch_catalog");
@@ -90,31 +111,65 @@ export default function App() {
   );
 
   const checkProject = useCallback(async (project: Project) => {
-    const st = await invoke<RepoState>("check_repo", { project });
-    setStatuses((prev) => ({ ...prev, [project.repo]: st }));
-    const upd = await invoke<string | null>("update_available", { project });
-    setUpdates((prev) => {
-      const copy = { ...prev };
-      if (upd) copy[project.repo] = upd;
-      else delete copy[project.repo];
-      return copy;
-    });
+    if (checking.current.has(project.repo)) return;
+    checking.current.add(project.repo);
+    try {
+      const st = await invoke<RepoState>("check_repo", { project });
+      setStatuses((prev) => ({ ...prev, [project.repo]: st }));
+      const upd = await invoke<string | null>("update_available", { project });
+      setUpdates((prev) => {
+        const copy = { ...prev };
+        if (upd) copy[project.repo] = upd;
+        else delete copy[project.repo];
+        return copy;
+      });
+    } catch (e) {
+      setError(formatError(e));
+    } finally {
+      checking.current.delete(project.repo);
+    }
   }, []);
 
   useEffect(() => {
     let unsubs: Array<() => void> = [];
+    let cancelled = false;
     (async () => {
       try {
         const s = await invoke<Settings>("get_settings");
+        if (cancelled) return;
         setSettings(s);
         setSelected(s.selected);
-        setFlagCatalog(await invoke<FlagCatalog>("flag_catalog"));
-        await Promise.all([refreshCatalog(), refreshFiles(), refreshTools(), refreshPreview()]);
+        // Show home immediately with featured fallback — PortWatch / tools load in parallel.
+        setCatalog({
+          featured: featuredFallback,
+          community: s.custom ?? [],
+          error: null,
+        });
+        setReady(true);
+
+        const [flags] = await Promise.all([
+          invoke<FlagCatalog>("flag_catalog"),
+          refreshFiles().catch((e) => {
+            setError(formatError(e));
+            return null;
+          }),
+          refreshTools().catch((e) => {
+            setError(formatError(e));
+            return null;
+          }),
+          refreshPreview().catch(() => undefined),
+          refreshCatalog().catch((e) => {
+            setError(formatError(e));
+            return null;
+          }),
+        ]);
+        if (cancelled) return;
+        setFlagCatalog(flags);
         setJob(await invoke<JobSnapshot>("get_job"));
+
         const u1 = await listen<JobSnapshot>("job", (e) => {
           const next = e.payload;
           setJob((prev) => {
-            // After install/update finishes, re-probe so the toast clears.
             if (prev.running && !next.running && !next.failed && next.repo) {
               const repo = next.repo;
               void refreshCatalog().then((c) => {
@@ -122,9 +177,15 @@ export default function App() {
                 const hit = all.find((p) => p.repo === repo);
                 if (hit) void checkProject(hit);
               });
+              void refreshTools();
             }
             return next;
           });
+          if (next.running && !autoOpenedJob.current) {
+            autoOpenedJob.current = true;
+            setModal("activity");
+          }
+          if (!next.running) autoOpenedJob.current = false;
         });
         const u2 = await listen("auto-check", () => {
           void refreshCatalog().then((c) => {
@@ -142,13 +203,13 @@ export default function App() {
           });
         });
         unsubs = [u1, u2, u3];
-        setReady(true);
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
+        setError(formatError(e));
         setReady(true);
       }
     })();
     return () => {
+      cancelled = true;
       for (const u of unsubs) u();
     };
   }, [checkProject, refreshCatalog, refreshFiles, refreshPreview, refreshTools]);
@@ -180,12 +241,6 @@ export default function App() {
     );
   }, [catalog, settings]);
 
-  const installedCount = useMemo(
-    () => Object.values(statuses).filter((s) => s.installed).length,
-    [statuses],
-  );
-  const updateCount = Object.keys(updates).length;
-
   async function start(
     kind: "install" | "play" | "uninstall" | "installTools" | "warmShaders",
     project?: Project,
@@ -193,9 +248,10 @@ export default function App() {
     setError(null);
     try {
       await invoke("start_job", { kind, project: project ?? null });
-      if (kind === "install" || kind === "play" || kind === "warmShaders") setPage("log");
+      setModal("activity");
+      autoOpenedJob.current = true;
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(formatError(e));
     }
   }
 
@@ -209,19 +265,27 @@ export default function App() {
   async function browseInstall() {
     const dir = await open({ directory: true, multiple: false, title: "Install folder" });
     if (!dir || Array.isArray(dir)) return;
-    const move = window.confirm("Move existing installed projects to this folder?");
-    const s = await invoke<Settings>("set_install_folder", { dir, moveProjects: move });
-    setSettings(s);
+    try {
+      const move = window.confirm("Move existing installed projects to this folder?");
+      const s = await invoke<Settings>("set_install_folder", { dir, moveProjects: move });
+      setSettings(s);
+    } catch (e) {
+      setError(formatError(e));
+    }
   }
 
   async function findGame() {
+    setSearchingGame(true);
+    setError(null);
     try {
       const found = await invoke<string>("search_game_folder");
       if (!settings) return;
       await persist({ ...settings, gameDir: found });
       await refreshFiles();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(formatError(e));
+    } finally {
+      setSearchingGame(false);
     }
   }
 
@@ -229,13 +293,14 @@ export default function App() {
     try {
       await invoke<Project>("add_custom_repo", { link: customLink });
       setCustomLink("");
+      setModal(null);
       await refreshCatalog();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(formatError(e));
     }
   }
 
-  if (!ready || !settings || !catalog) {
+  if (!ready || !settings) {
     return (
       <div className="app">
         <Titlebar />
@@ -251,13 +316,13 @@ export default function App() {
     );
   }
 
-  const featured = catalog.featured;
+  const featured = catalog?.featured ?? featuredFallback;
   const featuredState = statuses[featured.repo];
   const featuredUpdate = updates[featured.repo];
   const toolsReady = !!(tools?.git && tools.cargo && tools.msvc);
   const canPlay = !!files?.ok && !!featuredState?.installed && !job.running;
   const noticeProject =
-    noticeRepo == null
+    noticeRepo == null || !catalog
       ? null
       : [catalog.featured, ...catalog.community].find((p) => p.repo === noticeRepo) ?? null;
 
@@ -284,469 +349,415 @@ export default function App() {
         />
       ) : null}
 
-      <div className="workspace">
-        <aside className="rail">
-          <div className="rail-brand">
-            <img src={logo} alt="" className="rail-logo" />
+      <main className="home">
+        <header className="home-top reveal" style={{ ["--d" as string]: "0ms" }}>
+          <div className="home-brand">
+            <img src={logo} alt="" className="home-logo" />
             <div>
-              <strong>Ad3lHub</strong>
-              <span>Victory launcher</span>
+              <h1 className="wordmark">Ad3lHub</h1>
+              <p className="tagline">Install, update, and play Victory forks.</p>
             </div>
           </div>
-          <nav className="rail-nav">
+          <div className="home-actions">
             <button
               type="button"
-              className={`rail-link ${page === "library" ? "active" : ""}`}
-              onClick={() => setPage("library")}
+              className="btn ghost icon-btn"
+              title="Activity"
+              onClick={() => setModal("activity")}
             >
-              <IconLibrary />
-              <span>Library</span>
+              <IconTerminal size={16} />
+              {job.running ? <em className="job-dot" /> : null}
             </button>
             <button
               type="button"
-              className={`rail-link ${page === "community" ? "active" : ""}`}
-              onClick={() => setPage("community")}
+              className="btn ghost icon-btn"
+              title="Settings"
+              onClick={() => setModal("settings")}
             >
-              <IconUsers />
-              <span>Community</span>
-              {gpuFiltered.length > 0 ? (
-                <em className="rail-count">{gpuFiltered.length}</em>
-              ) : null}
+              <IconGear size={16} />
             </button>
             <button
               type="button"
-              className={`rail-link ${page === "settings" ? "active" : ""}`}
-              onClick={() => setPage("settings")}
+              className="btn ghost"
+              onClick={() => void refreshCatalog().catch((e) => setError(formatError(e)))}
             >
-              <IconGear />
-              <span>Settings</span>
+              <IconRefresh size={14} /> Refresh
             </button>
-            <button
-              type="button"
-              className={`rail-link ${page === "log" ? "active" : ""}`}
-              onClick={() => setPage("log")}
-            >
-              <IconTerminal />
-              <span>Activity</span>
-              {job.running ? <em className="rail-dot" /> : null}
+          </div>
+        </header>
+
+        {error ? (
+          <p className="error banner-error" role="alert">
+            {error}
+            <button type="button" className="btn ghost" onClick={() => setError(null)}>
+              Dismiss
             </button>
-          </nav>
-          <div className="rail-foot">
-            <div className="rail-meta">
-              <span className={`pill ${toolsReady ? "good" : "warn"}`}>
-                {toolsReady ? <IconCheck size={12} /> : <IconAlert size={12} />}
-                Tools
-              </span>
-              {updateCount > 0 ? (
+          </p>
+        ) : null}
+
+        <article className="hero reveal" style={{ ["--d" as string]: "40ms" }}>
+          <div className="hero-visual" aria-hidden>
+            <img src={logo} alt="" />
+            <div className="hero-ring" />
+          </div>
+          <div className="hero-body">
+            <p className="kicker">Featured · NVIDIA 8GB</p>
+            <h2>{featured.name}</h2>
+            <p className="summary">{featured.summary}</p>
+            <div className="meta">
+              <span className="pill mono">{featured.repo}</span>
+              {featuredState?.installed ? (
+                <span className="pill good">
+                  <IconCheck size={12} /> Installed
+                </span>
+              ) : (
+                <span className="pill">Not installed</span>
+              )}
+              {featuredUpdate ? (
                 <span className="pill warn">
-                  <IconRefresh size={12} />
-                  {updateCount}
+                  <IconRefresh size={12} /> Update
                 </span>
               ) : null}
+              {job.running && job.repo === featured.repo ? (
+                <span className="pill warn">{job.stage || "Working…"}</span>
+              ) : null}
             </div>
+            <div className="actions hero-actions">
+              {featuredUpdate ? (
+                <>
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={job.running || !toolsReady}
+                    onClick={() => void start("install", featured)}
+                  >
+                    <IconRefresh size={14} /> Update now
+                  </button>
+                  <button
+                    type="button"
+                    className="btn secondary"
+                    onClick={() =>
+                      void invoke("defer_update", {
+                        repo: featured.repo,
+                        commit: featuredUpdate,
+                      }).then(() => checkProject(featured))
+                    }
+                  >
+                    Later
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={job.running || !toolsReady}
+                  onClick={() => void start("install", featured)}
+                >
+                  <IconDownload size={14} />
+                  {featuredState?.installed ? "Reinstall" : "Install"}
+                </button>
+              )}
+              <button
+                type="button"
+                className="btn secondary"
+                disabled={!canPlay}
+                onClick={() => void start("play", featured)}
+              >
+                <IconPlay size={14} /> Play
+              </button>
+              <button
+                type="button"
+                className="btn secondary"
+                disabled={job.running || !featuredState?.installed || !files?.ok}
+                onClick={() => void start("warmShaders", featured)}
+              >
+                <IconFlame size={14} /> Warm
+              </button>
+              {featuredState?.installed ? (
+                <button
+                  type="button"
+                  className="btn danger"
+                  disabled={job.running}
+                  onClick={() => setConfirmUninstall(featured)}
+                >
+                  Uninstall
+                </button>
+              ) : null}
+            </div>
+            {!toolsReady ? (
+              <p className="hint">
+                Install Git, Rust, and MSVC before building — use the tools strip below.
+              </p>
+            ) : null}
+          </div>
+        </article>
+
+        <section className="strip reveal" style={{ ["--d" as string]: "90ms" }}>
+          <div className="strip-block">
+            <h3>
+              <IconFolder size={14} /> Game folder
+            </h3>
+            <p className="hint">Ad3lHub never downloads the game — point at your title files.</p>
+            <label className="field">
+              Path
+              <input
+                type="text"
+                value={settings.gameDir}
+                onChange={(e) => setSettings({ ...settings, gameDir: e.target.value })}
+                onBlur={() => void persist(settings).then(() => refreshFiles())}
+                placeholder="Folder with game_scarlett_master.exe"
+              />
+            </label>
+            <div className="actions">
+              <button type="button" className="btn secondary" onClick={() => void browseGame()}>
+                Browse
+              </button>
+              <button
+                type="button"
+                className="btn secondary"
+                disabled={searchingGame}
+                onClick={() => void findGame()}
+              >
+                {searchingGame ? "Searching…" : "Find on drives"}
+              </button>
+            </div>
+            {files ? (
+              <ul className="files compact">
+                {files.empty ? <li className="bad">Folder is empty</li> : null}
+                {files.files.map(([name, ok]) => (
+                  <li key={name} className={ok ? "ok" : "bad"}>
+                    {ok ? "✓" : "✗"} {name}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
+
+          <div className="strip-block">
+            <h3>Toolchain</h3>
+            <div className="tool-grid">
+              <span className={`tool ${tools?.git ? "on" : ""}`}>
+                {tools?.git ? <IconCheck size={12} /> : <IconAlert size={12} />}
+                Git
+              </span>
+              <span className={`tool ${tools?.cargo ? "on" : ""}`}>
+                {tools?.cargo ? <IconCheck size={12} /> : <IconAlert size={12} />}
+                Rust
+              </span>
+              <span className={`tool ${tools?.msvc ? "on" : ""}`}>
+                {tools?.msvc ? <IconCheck size={12} /> : <IconAlert size={12} />}
+                MSVC
+              </span>
+            </div>
+            {!toolsReady ? (
+              <button
+                type="button"
+                className="btn"
+                disabled={job.running || !tools?.winget}
+                onClick={() => void start("installTools")}
+              >
+                Install missing tools
+              </button>
+            ) : (
+              <p className="hint">Ready to clone and build.</p>
+            )}
             <p className="hint stage">{job.stage || "Idle"}</p>
           </div>
-        </aside>
+        </section>
 
-        <main className="main">
-          {page === "library" ? (
-            <section className="page" key="library">
-              <div className="page-head reveal" style={{ ["--d" as string]: "0ms" }}>
-                <div>
-                  <p className="eyebrow">Library</p>
-                  <h1>Play the featured fork</h1>
-                  <p>Install once, warm shaders, then launch with your game folder.</p>
-                </div>
-                <div className="actions">
-                  <button type="button" className="btn ghost" onClick={() => void refreshCatalog()}>
-                    <IconRefresh size={14} /> Refresh
-                  </button>
-                </div>
-              </div>
-
-              <div className="library-grid">
-                <div className="library-main">
-                  <article className="hero reveal" style={{ ["--d" as string]: "60ms" }}>
-                    <div className="hero-visual" aria-hidden>
-                      <img src={logo} alt="" />
-                      <div className="hero-ring" />
-                    </div>
-                    <div className="hero-body">
-                      <p className="kicker">Featured · NVIDIA 8GB</p>
-                      <h2>{featured.name}</h2>
-                      <p className="summary">{featured.summary}</p>
+        <section className="community reveal" style={{ ["--d" as string]: "130ms" }}>
+          <div className="section-head">
+            <div>
+              <h3>
+                <IconUsers size={14} /> Community projects
+              </h3>
+              <p className="hint">PortWatch builds after the featured NVIDIA fork.</p>
+            </div>
+            <div className="actions">
+              <label className="field filter">
+                GPU
+                <select
+                  value={settings.gpuFilter}
+                  onChange={(e) => {
+                    const next = { ...settings, gpuFilter: Number(e.target.value) };
+                    setSettings(next);
+                    void persist(next);
+                  }}
+                >
+                  <option value={0}>All</option>
+                  <option value={1}>NVIDIA</option>
+                  <option value={2}>AMD</option>
+                  <option value={3}>Intel</option>
+                </select>
+              </label>
+              <button type="button" className="btn secondary" onClick={() => setModal("addRepo")}>
+                Add repo
+              </button>
+            </div>
+          </div>
+          {catalog?.error ? <p className="error">{catalog.error}</p> : null}
+          <div className="project-list">
+            {gpuFiltered.length === 0 ? (
+              <p className="hint">No community projects yet — refresh or add a GitHub repo.</p>
+            ) : (
+              gpuFiltered.map((p) => {
+                const st = statuses[p.repo];
+                const upd = updates[p.repo];
+                const active = selected === p.repo;
+                return (
+                  <div
+                    key={p.repo}
+                    className={`project-row ${active ? "active" : ""}`}
+                    onClick={() => {
+                      setSelected(p.repo);
+                      void persist({ ...settings, selected: p.repo });
+                    }}
+                  >
+                    <div className="project-body">
+                      <h4>{p.name}</h4>
+                      <p className="mono">{p.repo}</p>
                       <div className="meta">
-                        <span className="pill mono">{featured.repo}</span>
-                        {featuredState?.installed ? (
+                        {p.verified ? <span className="pill good">Verified</span> : null}
+                        {p.fps != null ? <span className="pill">{p.fps.toFixed(1)} fps</span> : null}
+                        {st?.installed ? (
                           <span className="pill good">
                             <IconCheck size={12} /> Installed
                           </span>
-                        ) : (
-                          <span className="pill">Not installed</span>
-                        )}
-                        {featuredUpdate ? (
+                        ) : null}
+                        {upd ? (
                           <span className="pill warn">
                             <IconRefresh size={12} /> Update
                           </span>
                         ) : null}
                       </div>
-                      <div className="actions hero-actions">
-                        {featuredUpdate ? (
-                          <>
-                            <button
-                              type="button"
-                              className="btn"
-                              disabled={job.running || !toolsReady}
-                              onClick={() => void start("install", featured)}
-                            >
-                              <IconRefresh size={14} /> Update now
-                            </button>
-                            <button
-                              type="button"
-                              className="btn secondary"
-                              onClick={() =>
-                                void invoke("defer_update", {
-                                  repo: featured.repo,
-                                  commit: featuredUpdate,
-                                }).then(() => checkProject(featured))
-                              }
-                            >
-                              Later
-                            </button>
-                          </>
-                        ) : (
-                          <button
-                            type="button"
-                            className="btn"
-                            disabled={job.running || !toolsReady}
-                            onClick={() => void start("install", featured)}
-                          >
-                            <IconDownload size={14} />
-                            {featuredState?.installed ? "Reinstall" : "Install"}
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          className="btn secondary"
-                          disabled={!canPlay}
-                          onClick={() => void start("play", featured)}
-                        >
-                          <IconPlay size={14} /> Play
-                        </button>
-                        <button
-                          type="button"
-                          className="btn secondary"
-                          disabled={job.running || !featuredState?.installed || !files?.ok}
-                          onClick={() => void start("warmShaders", featured)}
-                        >
-                          <IconFlame size={14} /> Warm
-                        </button>
-                        {featuredState?.installed ? (
-                          <button
-                            type="button"
-                            className="btn danger"
-                            disabled={job.running}
-                            onClick={() => {
-                              if (window.confirm(`Uninstall ${featured.name}?`)) {
-                                void start("uninstall", featured);
-                              }
-                            }}
-                          >
-                            Uninstall
-                          </button>
-                        ) : null}
-                      </div>
                     </div>
-                  </article>
-
-                  <div className="stat-strip reveal" style={{ ["--d" as string]: "120ms" }}>
-                    <div className="stat">
-                      <IconLibrary size={18} />
-                      <div>
-                        <b>{installedCount}</b>
-                        <span>Installed</span>
-                      </div>
-                    </div>
-                    <div className="stat">
-                      <IconFolder size={18} />
-                      <div>
-                        <b>{files?.ok ? "Ready" : "Set folder"}</b>
-                        <span>Game files</span>
-                      </div>
-                    </div>
-                    <div className="stat">
-                      <IconGear size={18} />
-                      <div>
-                        <b>{settings.preset}</b>
-                        <span>Launch preset</span>
-                      </div>
-                    </div>
-                    <div className="stat">
-                      <IconFlame size={18} />
-                      <div>
-                        <b>{settings.warmBeforePlay ? "On" : "Off"}</b>
-                        <span>Warm before play</span>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="panel soft reveal" style={{ ["--d" as string]: "180ms" }}>
-                    <div className="section-head">
-                      <div>
-                        <h3>
-                          <IconUsers size={14} /> Community shortcuts
-                        </h3>
-                        <p className="hint">PortWatch builds live in Community — open that rail.</p>
-                      </div>
-                      <button type="button" className="btn ghost" onClick={() => setPage("community")}>
-                        Browse →
+                    <div className="actions" onClick={(e) => e.stopPropagation()}>
+                      <button
+                        type="button"
+                        className="btn secondary"
+                        disabled={job.running || !toolsReady}
+                        onClick={() => void start("install", p)}
+                      >
+                        {upd ? "Update" : st?.installed ? "Reinstall" : "Install"}
                       </button>
-                    </div>
-                  </div>
-                </div>
-
-                <aside className="library-side">
-                  <div className="panel soft reveal" style={{ ["--d" as string]: "90ms" }}>
-                    <h3>
-                      <IconFolder size={14} /> Game folder
-                    </h3>
-                    <p className="hint">Your title files — Ad3lHub never downloads the game.</p>
-                    <label className="field">
-                      Path
-                      <input
-                        type="text"
-                        value={settings.gameDir}
-                        onChange={(e) => setSettings({ ...settings, gameDir: e.target.value })}
-                        onBlur={() => void persist(settings).then(() => refreshFiles())}
-                        placeholder="Folder with game_scarlett_master.exe"
-                      />
-                    </label>
-                    <div className="actions">
-                      <button type="button" className="btn secondary" onClick={() => void browseGame()}>
-                        Browse
-                      </button>
-                      <button type="button" className="btn secondary" onClick={() => void findGame()}>
-                        Find on drives
-                      </button>
-                    </div>
-                    {files ? (
-                      <ul className="files">
-                        {files.empty ? <li className="bad">Folder is empty</li> : null}
-                        {files.files.map(([name, ok]) => (
-                          <li key={name} className={ok ? "ok" : "bad"}>
-                            {ok ? "✓" : "✗"} {name}
-                          </li>
-                        ))}
-                      </ul>
-                    ) : null}
-                  </div>
-
-                  <div className="panel soft reveal" style={{ ["--d" as string]: "150ms" }}>
-                    <h3>Toolchain</h3>
-                    <div className="tool-grid">
-                      <span className={`tool ${tools?.git ? "on" : ""}`}>
-                        {tools?.git ? <IconCheck size={12} /> : <IconAlert size={12} />}
-                        Git
-                      </span>
-                      <span className={`tool ${tools?.cargo ? "on" : ""}`}>
-                        {tools?.cargo ? <IconCheck size={12} /> : <IconAlert size={12} />}
-                        Rust
-                      </span>
-                      <span className={`tool ${tools?.msvc ? "on" : ""}`}>
-                        {tools?.msvc ? <IconCheck size={12} /> : <IconAlert size={12} />}
-                        MSVC
-                      </span>
-                    </div>
-                    {!toolsReady ? (
                       <button
                         type="button"
                         className="btn"
-                        disabled={job.running || !tools?.winget}
-                        onClick={() => void start("installTools")}
+                        disabled={job.running || !files?.ok || !st?.installed}
+                        onClick={() => void start("play", p)}
                       >
-                        Install missing tools
+                        <IconPlay size={14} /> Play
                       </button>
-                    ) : (
-                      <p className="hint">Ready to clone and build.</p>
-                    )}
-                    <button
-                      type="button"
-                      className="btn ghost"
-                      onClick={() => setPage("settings")}
-                    >
-                      <IconGear size={14} /> Launch flags & presets
-                    </button>
-                  </div>
-                </aside>
-              </div>
-            </section>
-          ) : null}
-
-          {page === "community" ? (
-            <section className="page" key="community">
-              <div className="page-head reveal" style={{ ["--d" as string]: "0ms" }}>
-                <div>
-                  <p className="eyebrow">Community</p>
-                  <h1>PortWatch projects</h1>
-                  <p>Everything after the featured NVIDIA fork.</p>
-                </div>
-                <label className="field filter">
-                  GPU
-                  <select
-                    value={settings.gpuFilter}
-                    onChange={(e) => {
-                      const next = { ...settings, gpuFilter: Number(e.target.value) };
-                      setSettings(next);
-                      void persist(next);
-                    }}
-                  >
-                    <option value={0}>All</option>
-                    <option value={1}>NVIDIA</option>
-                    <option value={2}>AMD</option>
-                    <option value={3}>Intel</option>
-                  </select>
-                </label>
-              </div>
-              {catalog.error ? <p className="error">{catalog.error}</p> : null}
-              <div className="project-grid">
-                {gpuFiltered.map((p, i) => {
-                  const st = statuses[p.repo];
-                  const upd = updates[p.repo];
-                  const active = selected === p.repo;
-                  return (
-                    <div
-                      key={p.repo}
-                      className={`project-card reveal ${active ? "active" : ""}`}
-                      style={{ ["--d" as string]: `${40 + i * 35}ms` }}
-                      onClick={() => {
-                        setSelected(p.repo);
-                        void persist({ ...settings, selected: p.repo });
-                      }}
-                    >
-                      <div className="project-mark">
-                        <IconUsers size={18} />
-                      </div>
-                      <div className="project-body">
-                        <h4>{p.name}</h4>
-                        <p className="mono">{p.repo}</p>
-                        <div className="meta">
-                          {p.verified ? <span className="pill good">Verified</span> : null}
-                          {p.fps != null ? <span className="pill">{p.fps.toFixed(1)} fps</span> : null}
-                          {st?.installed ? (
-                            <span className="pill good">
-                              <IconCheck size={12} /> Installed
-                            </span>
-                          ) : null}
-                          {upd ? (
-                            <span className="pill warn">
-                              <IconRefresh size={12} /> Update
-                            </span>
-                          ) : null}
-                        </div>
-                      </div>
-                      <div className="actions" onClick={(e) => e.stopPropagation()}>
+                      {st?.installed ? (
                         <button
                           type="button"
-                          className="btn secondary"
-                          disabled={job.running || !toolsReady}
-                          onClick={() => void start("install", p)}
+                          className="btn danger"
+                          disabled={job.running}
+                          onClick={() => setConfirmUninstall(p)}
                         >
-                          {upd ? "Update" : st?.installed ? "Reinstall" : "Install"}
+                          Uninstall
                         </button>
-                        <button
-                          type="button"
-                          className="btn"
-                          disabled={job.running || !files?.ok || !st?.installed}
-                          onClick={() => void start("play", p)}
-                        >
-                          <IconPlay size={14} /> Play
-                        </button>
-                      </div>
+                      ) : null}
                     </div>
-                  );
-                })}
-              </div>
-              <div className="panel soft reveal" style={{ ["--d" as string]: "200ms" }}>
-                <h3>Add GitHub repo</h3>
-                <div className="add-row">
-                  <label className="field grow">
-                    Link
-                    <input
-                      type="text"
-                      value={customLink}
-                      onChange={(e) => setCustomLink(e.target.value)}
-                      placeholder="owner/name"
-                    />
-                  </label>
-                  <button type="button" className="btn secondary" onClick={() => void addCustom()}>
-                    Add
-                  </button>
-                </div>
-              </div>
-            </section>
-          ) : null}
-
-          {page === "settings" ? (
-            <section className="page" key="settings">
-              <div className="page-head reveal" style={{ ["--d" as string]: "0ms" }}>
-                <div>
-                  <p className="eyebrow">Settings</p>
-                  <h1>Launch profile</h1>
-                  <p>Presets and curated VICTORY_* flags — more than Mandyhub.</p>
-                </div>
-              </div>
-              <div className="settings-grid">
-                <div className="settings-main reveal" style={{ ["--d" as string]: "60ms" }}>
-                  {flagCatalog ? (
-                    <AdvancedSettings
-                      settings={settings}
-                      catalog={flagCatalog}
-                      preview={preview}
-                      onChange={setSettings}
-                      onPersist={(next) => void persist(next)}
-                      onPreset={(id) => {
-                        void invoke<Settings>("apply_preset", { preset: id }).then(async (s) => {
-                          setSettings(s);
-                          await refreshPreview();
-                        });
-                      }}
-                    />
-                  ) : null}
-                </div>
-                <aside className="settings-side reveal" style={{ ["--d" as string]: "120ms" }}>
-                  <div className="panel soft">
-                    <h3>Install folder</h3>
-                    <p className="hint mono">
-                      {settings.installDir || "%LOCALAPPDATA%\\Ad3lHub"}
-                    </p>
-                    <button type="button" className="btn secondary" onClick={() => void browseInstall()}>
-                      Choose folder…
-                    </button>
                   </div>
-                </aside>
-              </div>
-            </section>
-          ) : null}
+                );
+              })
+            )}
+          </div>
+        </section>
+      </main>
 
-          {page === "log" ? (
-            <section className="page" key="log">
-              <div className="page-head reveal" style={{ ["--d" as string]: "0ms" }}>
-                <div>
-                  <p className="eyebrow">Activity</p>
-                  <h1>{job.stage || "No job running"}</h1>
-                  <p>Install, warm, and play output lands here.</p>
-                </div>
-              </div>
-              {error ? <p className="error">{error}</p> : null}
-              <pre className="log reveal" style={{ ["--d" as string]: "80ms" }}>
-                {job.log.length
-                  ? job.log.slice(-300).join("\n")
-                  : "Install, warm, or play to see output here."}
-              </pre>
-            </section>
-          ) : null}
-        </main>
-      </div>
+      <Modal open={modal === "settings"} title="Launch profile" onClose={() => setModal(null)} wide>
+        <div className="settings-modal">
+          {flagCatalog ? (
+            <AdvancedSettings
+              settings={settings}
+              catalog={flagCatalog}
+              preview={preview}
+              onChange={setSettings}
+              onPersist={(next) => void persist(next)}
+              onPreset={(id) => {
+                void invoke<Settings>("apply_preset", { preset: id })
+                  .then(async (s) => {
+                    setSettings(s);
+                    await refreshPreview();
+                  })
+                  .catch((e) => setError(formatError(e)));
+              }}
+            />
+          ) : (
+            <p className="hint">Loading flags…</p>
+          )}
+          <div className="panel soft">
+            <h3>Install folder</h3>
+            <p className="hint mono">{settings.installDir || "%LOCALAPPDATA%\\Ad3lHub"}</p>
+            <button type="button" className="btn secondary" onClick={() => void browseInstall()}>
+              Choose folder…
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal
+        open={modal === "activity"}
+        title={job.stage || "Activity"}
+        onClose={() => setModal(null)}
+        wide
+      >
+        {job.failed ? <p className="error">Last job failed — see the log.</p> : null}
+        <pre className="log">
+          {job.log.length
+            ? job.log.slice(-400).join("\n")
+            : "Install, warm, or play to see output here."}
+        </pre>
+      </Modal>
+
+      <Modal
+        open={modal === "addRepo"}
+        title="Add GitHub repo"
+        onClose={() => setModal(null)}
+        footer={
+          <div className="actions">
+            <button type="button" className="btn secondary" onClick={() => setModal(null)}>
+              Cancel
+            </button>
+            <button type="button" className="btn" onClick={() => void addCustom()}>
+              Add
+            </button>
+          </div>
+        }
+      >
+        <label className="field">
+          Link
+          <input
+            type="text"
+            value={customLink}
+            onChange={(e) => setCustomLink(e.target.value)}
+            placeholder="owner/name or https://github.com/owner/name"
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void addCustom();
+            }}
+          />
+        </label>
+      </Modal>
+
+      <ConfirmModal
+        open={!!confirmUninstall}
+        title="Uninstall project"
+        body={
+          confirmUninstall
+            ? `Remove ${confirmUninstall.name} (${confirmUninstall.repo})? Saves in the data folder are kept.`
+            : ""
+        }
+        confirmLabel="Uninstall"
+        danger
+        onCancel={() => setConfirmUninstall(null)}
+        onConfirm={() => {
+          const p = confirmUninstall;
+          setConfirmUninstall(null);
+          if (p) void start("uninstall", p);
+        }}
+      />
     </div>
   );
 }

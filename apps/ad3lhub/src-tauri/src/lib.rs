@@ -278,12 +278,11 @@ fn get_job(state: State<'_, AppState>) -> JobSnapshot {
 
 #[tauri::command]
 fn check_repo(state: State<'_, AppState>, project: Project) -> RepoState {
+    // Always recompute — a previous "checking" early-return could stick forever
+    // if two invokes raced. Mark checking only as a UI hint while we work.
     {
         let mut m = state.repos.lock();
         let e = m.entry(project.repo.clone()).or_default();
-        if e.checking {
-            return e.clone();
-        }
         e.checking = true;
     }
     let st = repo_state(&project);
@@ -360,6 +359,10 @@ fn start_job(
     kind: JobKind,
     project: Option<Project>,
 ) -> Result<(), String> {
+    let needs_project = !matches!(kind, JobKind::InstallTools);
+    if needs_project && project.is_none() {
+        return Err("no project selected for this job".into());
+    }
     {
         let mut j = state.job.lock();
         if j.running {
@@ -383,57 +386,66 @@ fn start_job(
     std::thread::spawn(move || {
         let result = match kind {
             JobKind::InstallTools => install_tools(&app, &job),
-            JobKind::Install => {
-                let p = project.as_ref().expect("project");
-                let updating = paths::built_exe(&p.repo).is_file();
-                let r = install(&app, &job, p);
-                if r.is_ok() {
-                    // Drop deferred "Later" for this repo — tip is installed now.
-                    {
-                        let mut s = settings_live.lock();
-                        s.later.retain(|(repo, _)| repo != &p.repo);
-                        let _ = save_settings(&settings_path, &s);
+            JobKind::Install => match project.as_ref() {
+                None => Err("no project selected".into()),
+                Some(p) => {
+                    let updating = paths::built_exe(&p.repo).is_file();
+                    let r = install(&app, &job, p);
+                    if r.is_ok() {
+                        // Drop deferred "Later" for this repo — tip is installed now.
+                        {
+                            let mut s = settings_live.lock();
+                            s.later.retain(|(repo, _)| repo != &p.repo);
+                            let _ = save_settings(&settings_path, &s);
+                        }
+                        let mut j = job.lock();
+                        j.stage = if updating {
+                            "Updated: ready to play".into()
+                        } else {
+                            "Installed: ready to play".into()
+                        };
                     }
-                    let mut j = job.lock();
-                    j.stage = if updating {
-                        "Updated: ready to play".into()
-                    } else {
-                        "Installed: ready to play".into()
-                    };
+                    r
                 }
-                r
-            }
-            JobKind::Uninstall => uninstall(&app, &job, project.as_ref().expect("project")),
-            JobKind::WarmShaders => {
-                let p = project.as_ref().expect("project");
-                let plan = settings_snap.launch_plan();
-                let env = resolve_env(&plan);
-                warm_shaders(
-                    &app,
-                    &job,
-                    p,
-                    &PathBuf::from(&settings_snap.game_dir),
-                    &env,
-                    settings_snap.always_rewarm,
-                    settings_snap.warm_pipelines,
-                )
-            }
-            JobKind::Play => {
-                let p = project.as_ref().expect("project");
-                let plan = settings_snap.launch_plan();
-                let env = resolve_env(&plan);
-                play(
-                    &app,
-                    &job,
-                    p,
-                    &PathBuf::from(&settings_snap.game_dir),
-                    &env,
-                    plan.fullscreen_hook,
-                    settings_snap.warm_before_play,
-                    settings_snap.always_rewarm,
-                    settings_snap.warm_pipelines,
-                )
-            }
+            },
+            JobKind::Uninstall => match project.as_ref() {
+                Some(p) => uninstall(&app, &job, p),
+                None => Err("no project selected".into()),
+            },
+            JobKind::WarmShaders => match project.as_ref() {
+                None => Err("no project selected".into()),
+                Some(p) => {
+                    let plan = settings_snap.launch_plan();
+                    let env = resolve_env(&plan);
+                    warm_shaders(
+                        &app,
+                        &job,
+                        p,
+                        &PathBuf::from(&settings_snap.game_dir),
+                        &env,
+                        settings_snap.always_rewarm,
+                        settings_snap.warm_pipelines,
+                    )
+                }
+            },
+            JobKind::Play => match project.as_ref() {
+                None => Err("no project selected".into()),
+                Some(p) => {
+                    let plan = settings_snap.launch_plan();
+                    let env = resolve_env(&plan);
+                    play(
+                        &app,
+                        &job,
+                        p,
+                        &PathBuf::from(&settings_snap.game_dir),
+                        &env,
+                        plan.fullscreen_hook,
+                        settings_snap.warm_before_play,
+                        settings_snap.always_rewarm,
+                        settings_snap.warm_pipelines,
+                    )
+                }
+            },
         };
 
         {

@@ -1,20 +1,32 @@
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, type Window } from "@tauri-apps/api/window";
 import { useRef } from "react";
 import logo from "../assets/logo.png";
 
+function tryWindow(): Window | null {
+  try {
+    return getCurrentWindow();
+  } catch {
+    return null;
+  }
+}
+
 export function Titlebar() {
-  const win = getCurrentWindow();
+  const winRef = useRef<Window | null>(null);
+  if (winRef.current === null) {
+    winRef.current = tryWindow();
+  }
   const dragging = useRef(false);
+
+  const win = winRef.current;
 
   return (
     <header
       className="titlebar"
       data-tauri-drag-region
       onPointerDown={(e) => {
-        if (e.button !== 0) return;
+        if (e.button !== 0 || !win) return;
         const t = e.target as HTMLElement;
         if (t.closest(".titlebar-controls")) return;
-        // Avoid stacking drag calls while webview drag-region boots.
         if (dragging.current) return;
         dragging.current = true;
         void win.startDragging().finally(() => {
@@ -31,7 +43,7 @@ export function Titlebar() {
           type="button"
           className="titlebar-btn"
           aria-label="Minimize"
-          onClick={() => void win.minimize()}
+          onClick={() => void win?.minimize()}
         >
           <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden>
             <path d="M1 5h8" stroke="currentColor" strokeWidth="1.2" />
@@ -42,7 +54,7 @@ export function Titlebar() {
           className="titlebar-btn"
           aria-label="Maximize"
           onClick={() =>
-            void win.isMaximized().then((m) => (m ? win.unmaximize() : win.maximize()))
+            void win?.isMaximized().then((m) => (m ? win.unmaximize() : win.maximize()))
           }
         >
           <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden>
@@ -61,7 +73,7 @@ export function Titlebar() {
           type="button"
           className="titlebar-btn titlebar-btn-close"
           aria-label="Close"
-          onClick={() => void win.close()}
+          onClick={() => void win?.close()}
         >
           <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden>
             <path d="M2 2l6 6M8 2L2 8" stroke="currentColor" strokeWidth="1.2" />

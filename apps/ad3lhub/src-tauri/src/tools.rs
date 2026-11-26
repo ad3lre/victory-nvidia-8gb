@@ -113,6 +113,11 @@ fn msvc_installed() -> bool {
     })
 }
 
+/// Drop cached detection so the next `detect()` re-probes PATH (e.g. after winget).
+pub fn invalidate() {
+    *FOUND.lock() = None;
+}
+
 pub fn detect() -> Tools {
     let pf = env_path("ProgramFiles");
     let pf86 = env_path("ProgramFiles(x86)");

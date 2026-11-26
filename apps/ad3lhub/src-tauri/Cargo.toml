@@ -1,6 +1,6 @@
 [package]
 name = "ad3lhub"
-version = "0.4.1"
+version = "0.5.0"
 description = "Ad3lHub: Leo-styled launcher for VIctory-based projects"
 authors = ["Ad3l"]
 edition = "2021"
