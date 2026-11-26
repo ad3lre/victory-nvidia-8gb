@@ -2,7 +2,8 @@
 resolver = "3"
 members = ["crates/*", "apps/*", "xtask"]
 # Fixtures are standalone crates built on demand by integration tests.
-exclude = ["tests/fixtures"]
+# Ad3lHub is a separate Tauri package (Cargo.toml under apps/ad3lhub/src-tauri).
+exclude = ["tests/fixtures", "apps/ad3lhub"]
 
 [workspace.package]
 version = "0.1.0"

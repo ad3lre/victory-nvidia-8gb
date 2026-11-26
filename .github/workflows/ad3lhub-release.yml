@@ -1,0 +1,54 @@
+name: Ad3lHub release
+
+on:
+  push:
+    tags:
+      - "ad3lhub-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: apps/ad3lhub
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/ad3lhub/package-lock.json
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Build Ad3lHub (Windows)
+        run: npm run tauri:build
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist-release | Out-Null
+          Get-ChildItem -Recurse src-tauri\target\release\bundle |
+            Where-Object { $_.Extension -in ".exe",".msi" -or $_.Name -like "*.exe" } |
+            ForEach-Object { Copy-Item $_.FullName dist-release\ -Force }
+          Get-ChildItem src-tauri\target\release\ad3lhub.exe -ErrorAction SilentlyContinue |
+            ForEach-Object { Copy-Item $_.FullName dist-release\Ad3lHub.exe -Force }
+          Get-ChildItem dist-release
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: apps/ad3lhub/dist-release/*
+          generate_release_notes: true
+          name: Ad3lHub ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
