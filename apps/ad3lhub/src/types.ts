@@ -29,6 +29,9 @@ export type Settings = {
   preset: string;
   flags: Record<string, string>;
   showExpert: boolean;
+  warmBeforePlay: boolean;
+  alwaysRewarm: boolean;
+  warmPipelines: boolean;
 };
 
 export type Tools = {

@@ -125,7 +125,10 @@ export default function App() {
     );
   }, [catalog, settings]);
 
-  async function start(kind: "install" | "play" | "uninstall" | "installTools", project?: Project) {
+  async function start(
+    kind: "install" | "play" | "uninstall" | "installTools" | "warmShaders",
+    project?: Project,
+  ) {
     setError(null);
     try {
       await invoke("start_job", { kind, project: project ?? null });
@@ -265,6 +268,15 @@ export default function App() {
                 onClick={() => void start("play", featured)}
               >
                 Play
+              </button>
+              <button
+                type="button"
+                className="btn secondary"
+                disabled={job.running || !featuredState?.installed || !files?.ok}
+                title="Pretranslate shaders into the cache (AnyXboxX-style). Later Play skips when warm."
+                onClick={() => void start("warmShaders", featured)}
+              >
+                Warm shaders
               </button>
               {featuredState?.installed ? (
                 <button
