@@ -12,6 +12,7 @@ No game files are included or downloaded. You need your own copy of the game.
 - Game-folder check, drive search, install-folder move
 - Launch presets (Ad3l balanced, pareto, Series S low-memory, NVIDIA 8 GB) plus curated `VICTORY_*` flags for display, memory, performance, lighting, and diagnostics — more than Mandyhub’s few toggles
 - Freeform env overrides and an effective-environment preview for power users
+- **Shader warm** (AnyXboxX-style): `victory shaders` on game `.rpf` archives before Play, with a fingerprint marker so later launches skip when the build/flags/archives are unchanged; optional host pipeline prebuild
 - Detect Git / Rust / MSVC; install missing tools with winget
 - Update checks on start and every 15 minutes
 

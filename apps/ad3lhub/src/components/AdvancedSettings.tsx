@@ -108,6 +108,50 @@ export function AdvancedSettings({
         );
       })}
 
+      <div className="flag-group">
+        <h4>Shader warm (faster later launches)</h4>
+        <p className="hint">
+          Same trick as AnyXboxX: run <code>victory shaders</code> on the game’s .rpf archives before
+          Play, then skip when the warm marker still matches this build and flags.
+        </p>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={settings.warmBeforePlay}
+            onChange={(e) => {
+              const next = { ...settings, warmBeforePlay: e.target.checked };
+              onChange(next);
+              commit(next);
+            }}
+          />
+          Warm shaders before Play when stale
+        </label>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={settings.alwaysRewarm}
+            onChange={(e) => {
+              const next = { ...settings, alwaysRewarm: e.target.checked };
+              onChange(next);
+              commit(next);
+            }}
+          />
+          Always re-warm (ignore marker)
+        </label>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={settings.warmPipelines}
+            onChange={(e) => {
+              const next = { ...settings, warmPipelines: e.target.checked };
+              onChange(next);
+              commit(next);
+            }}
+          />
+          Also prebuild host pipelines (slow, GPU/driver specific)
+        </label>
+      </div>
+
       <label className="check">
         <input
           type="checkbox"

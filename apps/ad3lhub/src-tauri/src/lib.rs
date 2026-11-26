@@ -5,10 +5,11 @@ mod jobs;
 mod paths;
 mod process_util;
 mod tools;
+mod warm_state;
 
 use catalog::{featured_project, fetch_portwatch, parse_repo, repo_state, Project, RepoState};
 use flags::{preset_flags, resolve_env, FlagCatalog, LaunchPlan};
-use jobs::{install, install_tools, play, uninstall, JobSnapshot, SharedJob};
+use jobs::{install, install_tools, play, uninstall, warm_shaders, JobSnapshot, SharedJob};
 use parking_lot::Mutex;
 use paths::{
     find_game_in, has_projects, migrate_old_folders, move_dir, normalize_dir, search_drives,
@@ -46,6 +47,19 @@ pub struct Settings {
     pub flags: BTreeMap<String, String>,
     #[serde(default)]
     pub show_expert: bool,
+    /// Run `victory shaders` before Play when the warm marker is stale (AnyXboxX trick).
+    #[serde(default = "default_true")]
+    pub warm_before_play: bool,
+    /// Always re-warm even when the marker matches.
+    #[serde(default)]
+    pub always_rewarm: bool,
+    /// Also run `victory translate --pipelines` after shaders (much slower; GPU-specific).
+    #[serde(default)]
+    pub warm_pipelines: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_preset() -> String {
@@ -75,6 +89,9 @@ impl Default for Settings {
             preset: default_preset(),
             flags: BTreeMap::new(),
             show_expert: false,
+            warm_before_play: true,
+            always_rewarm: false,
+            warm_pipelines: false,
         }
     }
 }
@@ -313,6 +330,7 @@ enum JobKind {
     Play,
     Uninstall,
     InstallTools,
+    WarmShaders,
 }
 
 #[tauri::command]
@@ -359,6 +377,20 @@ fn start_job(
                 r
             }
             JobKind::Uninstall => uninstall(&app, &job, project.as_ref().expect("project")),
+            JobKind::WarmShaders => {
+                let p = project.as_ref().expect("project");
+                let plan = settings.launch_plan();
+                let env = resolve_env(&plan);
+                warm_shaders(
+                    &app,
+                    &job,
+                    p,
+                    &PathBuf::from(&settings.game_dir),
+                    &env,
+                    settings.always_rewarm,
+                    settings.warm_pipelines,
+                )
+            }
             JobKind::Play => {
                 let p = project.as_ref().expect("project");
                 let plan = settings.launch_plan();
@@ -370,6 +402,9 @@ fn start_job(
                     &PathBuf::from(&settings.game_dir),
                     &env,
                     plan.fullscreen_hook,
+                    settings.warm_before_play,
+                    settings.always_rewarm,
+                    settings.warm_pipelines,
                 )
             }
         };
@@ -384,6 +419,7 @@ fn start_job(
                             JobKind::Uninstall => "Uninstalled".into(),
                             JobKind::Play => "Game closed".into(),
                             JobKind::InstallTools => "Tools installed".into(),
+                            JobKind::WarmShaders => "Shaders warmed".into(),
                             JobKind::Install => j.stage.clone(),
                         };
                     }
@@ -392,6 +428,7 @@ fn start_job(
                     j.failed = true;
                     j.stage = match kind {
                         JobKind::Install => "Install failed (see the log)".into(),
+                        JobKind::WarmShaders => "Warm failed (see the log)".into(),
                         _ => "Failed".into(),
                     };
                     j.log.push(format!("ERROR: {e}"));
@@ -401,7 +438,7 @@ fn start_job(
         let _ = app.emit("job", &job.lock().snapshot());
 
         if let Some(p) = project {
-            if !matches!(kind, JobKind::Play) {
+            if !matches!(kind, JobKind::Play | JobKind::WarmShaders) {
                 let st = repo_state(&p);
                 repos.lock().insert(p.repo.clone(), st);
             }

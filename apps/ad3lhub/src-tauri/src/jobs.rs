@@ -5,6 +5,7 @@ use crate::paths::{
 };
 use crate::process_util::hide_window;
 use crate::tools;
+use crate::warm_state;
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::io::{BufRead, BufReader};
@@ -195,13 +196,16 @@ pub fn uninstall(app: &AppHandle, job: &SharedJob, p: &Project) -> Result<(), St
     Ok(())
 }
 
-pub fn play(
+/// Prewarm the shader cache (`victory shaders …`), optionally host pipelines.
+/// Skips when the AnyXboxX-style warm marker already matches (unless `always`).
+pub fn warm_shaders(
     app: &AppHandle,
     job: &SharedJob,
     p: &Project,
     game_dir: &Path,
     env: &std::collections::BTreeMap<String, String>,
-    fullscreen: bool,
+    always: bool,
+    pipelines: bool,
 ) -> Result<(), String> {
     let exe = p
         .local_exe
@@ -211,12 +215,128 @@ pub fn play(
     if !exe.is_file() {
         return Err("this project is not installed yet: press Install".into());
     }
+    let ws = workspace();
+    let cache = ws.join("cache").join(slug(&p.repo));
+    let _ = std::fs::create_dir_all(&cache);
+    let archives = warm_state::warm_archives(game_dir)?;
+    let mut warm_env = env.clone();
+    warm_env.insert("VICTORY_CACHE_DIR".into(), cache.display().to_string());
+    warm_env.insert(
+        "VICTORY_DATA_DIR".into(),
+        ws.join("data").join(slug(&p.repo)).display().to_string(),
+    );
+
+    let build = warm_state::build_id(&exe);
+    let ids = warm_state::archive_identities(&archives);
+    let fp = warm_state::fingerprint(&build, &warm_env, &ids);
+    let marker = warm_state::marker_path(&cache);
+    let current = warm_state::read_marker(&marker);
+    if !warm_state::needs_warm(always, current.as_deref(), &fp) {
+        stage(app, job, "Shader cache already warm — skipping");
+        push_log(app, job, format!("warm marker ok ({fp})"));
+        return Ok(());
+    }
+
+    stage(
+        app,
+        job,
+        "Warming shaders (first time takes several minutes — later launches skip this)",
+    );
+    let dir = repo_dir(&p.repo);
+    let mut c = Command::new(&exe);
+    c.arg("shaders");
+    for a in &archives {
+        c.arg(a);
+    }
+    for (k, v) in detect_launch_env(&dir) {
+        c.env(&k, &v);
+    }
+    for (k, v) in &warm_env {
+        c.env(k, v);
+    }
+    push_log(
+        app,
+        job,
+        format!(
+            "victory shaders ({} archives) → {}",
+            archives.len(),
+            cache.display()
+        ),
+    );
+    run_cmd(app, job, &mut c)?;
+
+    if pipelines {
+        stage(app, job, "Prebuilding host pipelines (GPU-specific, slow)");
+        let shaders = game_dir.join("shaders.rpf");
+        let dlls = [
+            game_dir.join("XboxBvhBuilder.dll"),
+            game_dir.join("amd_fidelityfx_upscaler_xbox.dll"),
+        ];
+        if shaders.is_file() {
+            let mut t = Command::new(&exe);
+            t.arg("translate").arg("--pipelines").arg(&shaders);
+            let title = game_dir.join(EXE_NAME);
+            if title.is_file() {
+                t.arg(&title);
+            }
+            for d in &dlls {
+                if d.is_file() {
+                    t.arg(d);
+                }
+            }
+            for (k, v) in detect_launch_env(&dir) {
+                t.env(&k, &v);
+            }
+            for (k, v) in &warm_env {
+                t.env(k, v);
+            }
+            run_cmd(app, job, &mut t)?;
+        } else {
+            push_log(
+                app,
+                job,
+                format!(
+                    "no shaders.rpf in {} — pipeline prebuild skipped",
+                    game_dir.display()
+                ),
+            );
+        }
+    }
+
+    warm_state::write_marker(&marker, &fp)
+        .map_err(|e| format!("could not write warm marker: {e}"))?;
+    push_log(app, job, format!("warm marker written ({fp})"));
+    stage(app, job, "Shaders warmed — ready to play");
+    Ok(())
+}
+
+pub fn play(
+    app: &AppHandle,
+    job: &SharedJob,
+    p: &Project,
+    game_dir: &Path,
+    env: &std::collections::BTreeMap<String, String>,
+    fullscreen: bool,
+    warm_before: bool,
+    always_rewarm: bool,
+    warm_pipelines: bool,
+) -> Result<(), String> {
+    let exe = p
+        .local_exe
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| built_exe(&p.repo));
+    if !exe.is_file() {
+        return Err("this project is not installed yet: press Install".into());
+    }
+    if warm_before {
+        warm_shaders(app, job, p, game_dir, env, always_rewarm, warm_pipelines)?;
+    }
     stage(app, job, "Playing");
     let ws = workspace();
     let mut c = Command::new(&exe);
     c.arg("run").arg(game_dir.join(EXE_NAME)).arg("--execute");
     let dir = repo_dir(&p.repo);
-    // Project play.ps1 first; Ad3lHub resolved flags override afterward.
     for (k, v) in detect_launch_env(&dir) {
         c.env(&k, &v);
     }
