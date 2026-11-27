@@ -27,6 +27,7 @@
 
 use super::{Attr, Bin, Fields, Inst, Lower, Operand, Reg, Term, V, Why, flags, pred};
 use crate::bvh;
+use crate::native::RootType;
 use crate::resource::BvhNodes;
 
 #[cfg(test)]
@@ -135,6 +136,44 @@ impl<'a> Lower<'a> {
             inverse: [f[7], f[8], f[9]],
         };
         let c = self.cur;
+        // `VICTORY_BVH_NO_HIT=1` ([`crate::emit::bvh_no_hit`]): while the
+        // structures are not built, a box enters no child and anything else
+        // is missed, with nothing read.
+        let no_hit = crate::emit::bvh_no_hit();
+        let unbuilt = (no_hit != 0).then(|| {
+            let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+            let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+            let none = self.s.m.i32(bvh::NONE);
+            bvh::MISS.map(|miss| {
+                let miss = self.s.m.i32(miss.to_bits());
+                self.s.m.select(c, is_box, none, miss)
+            })
+        });
+        if let (1, Some(unbuilt)) = (no_hit, unbuilt) {
+            // The builder never runs: decided here.
+            let _ = &ray;
+            for (k, &r) in unbuilt.iter().enumerate() {
+                self.write(inst, Reg::V(dst + k as u8), r, guard);
+            }
+            return Ok(());
+        }
+        // Asked of the host: only the lanes that run where the builder runs
+        // whole read and test the node.
+        let built = (no_hit == 2).then(|| {
+            use super::super::shader::USER_STRUCTURES;
+            let word = self.host_word(RootType::Other(USER_STRUCTURES), 0, 0);
+            let zero = self.s.m.i32(0);
+            self.s.m.cmp(c, pred::NE, word, zero)
+        });
+        let tested = match (guard, built) {
+            (Some(g), Some(b)) => Some(self.s.m.bin(c, Bin::And, g, b)),
+            (g, None) => g,
+            (None, b) => b,
+        };
+        // (With `built`, the look in the directory is made inside the test's
+        // guard, so a node test that answers no hit reads nothing.)
+        let mut early = None;
         let at = match nodes {
             BvhNodes::Resource => {
                 let src = self
@@ -161,10 +200,16 @@ impl<'a> Lower<'a> {
                     *w = self.i32_of(v)?;
                 }
                 let (low, high) = self.bvh_address(words[0], words[1], pointer, pointer_high);
+                let mut look = guard;
+                if built.is_some() {
+                    early = Some(self.begin_guarded(tested));
+                    // Every lane in the guarded code runs the instruction.
+                    look = None;
+                }
                 // One look for the node's copy, before the branches: a
                 // node is 64 bytes on 64, so its first half lies in one
                 // 64 KiB page whatever its kind.
-                let (handle, byte, mapped) = self.bvh_memory(low, high, guard);
+                let (handle, byte, mapped) = self.bvh_memory(low, high, look);
                 NodeAt::Memory {
                     handle,
                     byte,
@@ -175,7 +220,10 @@ impl<'a> Lower<'a> {
             }
         };
         let zero = self.s.m.i32(0);
-        let gate = self.begin_guarded(guard);
+        let gate = match early {
+            Some(gate) => gate,
+            None => self.begin_guarded(tested),
+        };
         let head = self.cur;
         let (k4, k6, k7) = (self.s.m.i32(4), self.s.m.i32(6), self.s.m.i32(7));
         let kind = self.s.m.bin(head, Bin::And, pointer, k7);
@@ -214,7 +262,13 @@ impl<'a> Lower<'a> {
                     (other[k], leaf_block),
                 ],
             );
-            results.push((phi, zero));
+            // Outside the guard: lanes that do not run (not written), or
+            // with `built`, the answer while the structures are not built.
+            let outside = match (built, unbuilt) {
+                (Some(_), Some(unbuilt)) => unbuilt[k],
+                _ => zero,
+            };
+            results.push((phi, outside));
         }
         let results = self.end_guarded(gate, &results);
         for (k, &r) in results.iter().enumerate() {

@@ -670,11 +670,16 @@ mod tests {
     }
 
     #[test]
-    fn launch_presets_default_to_full_dred_and_debug() {
+    fn launch_presets_default_to_play_fps_diagnostics() {
         for id in ["ad3l-balanced", "pareto"] {
             let flags = preset_flags(id);
-            assert_eq!(flags.get("D3D12_DRED").map(String::as_str), Some("1"), "{id}");
-            assert_eq!(flags.get("D3D12_DEBUG").map(String::as_str), Some("1"), "{id}");
+            assert_eq!(flags.get("D3D12_DRED").map(String::as_str), Some("faults"), "{id}");
+            assert_eq!(flags.get("D3D12_DEBUG").map(String::as_str), Some("0"), "{id}");
+            assert_eq!(flags.get("VIEW_BYTES").map(String::as_str), Some("0"), "{id}");
+            assert_eq!(flags.get("WIDE_SPIN").map(String::as_str), Some("50"), "{id}");
+            assert_eq!(flags.get("BVH_NO_HIT").map(String::as_str), Some("1"), "{id}");
+            assert_eq!(flags.get("BVH_SKIP_COPY").map(String::as_str), Some("1"), "{id}");
+            assert_eq!(flags.get("EARLY_DEPTH").map(String::as_str), Some("1"), "{id}");
         }
     }
 

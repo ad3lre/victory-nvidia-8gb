@@ -66,6 +66,11 @@ pub(crate) struct Shader {
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
+    /// A compute program named `CopyForBVHUpdate`: a copy that feeds the
+    /// ray-tracing structure builder, with no effect while it is off
+    /// (looked for only with `VICTORY_BVH_SKIP_COPY=1`, [`is_bvh_copy_idle`]).
+    #[cfg(windows)]
+    bvh_copy: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -119,6 +124,12 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+                #[cfg(windows)]
+                bvh_copy: stage == "compute"
+                    && bvh_skip_copy()
+                    && bytes
+                        .windows(b"CopyForBVHUpdate".len())
+                        .any(|w| w == b"CopyForBVHUpdate"),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -326,6 +337,61 @@ pub(crate) fn builder_rests(why: &'static str) {
     if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
         tracing::warn!(why, "the ray-tracing structure builder rests for this frame and the next: its stages run all or none");
     }
+}
+
+/// Whether the structure builder runs whole now: it is asked for
+/// (`VICTORY_BVH_BUILDER=1`), a dispatch of it found every one of its
+/// programs with a host pipeline ([`builder_runs`]), none was added since,
+/// and it does not rest this frame ([`builder_rests`]). Unlike
+/// [`builder_runs`] it changes nothing, so any bind may ask: the host word
+/// `victory_shader::emit::USER_STRUCTURES` of the programs that walk the
+/// structures with `VICTORY_BVH_NO_HIT=1`, whose node tests answer no hit
+/// while this is false.
+#[cfg(windows)]
+pub(crate) fn builder_whole_now() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+        return false;
+    }
+    let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    b.whole && b.off != b.pipelines.len() && crate::frame::current() >= b.rests
+}
+
+/// Whether the structure builder is off now for certain: not asked for
+/// (`VICTORY_BVH_BUILDER=1`), none of its programs created yet or found
+/// without a host pipeline at its last dispatch with none added since, or
+/// resting this frame ([`builder_rests`]): what makes [`builder_runs`]
+/// answer no before it looks at the pipelines. Unlike it this changes
+/// nothing (no pipeline is made), and it is false while the builder has not
+/// been looked at since its last program was added, where it may yet run.
+#[cfg(windows)]
+pub(crate) fn builder_off_now() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+        return true;
+    }
+    let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    b.off == b.pipelines.len() || crate::frame::current() < b.rests
+}
+
+/// `VICTORY_BVH_SKIP_COPY=1` (off by default): the title's compute passes
+/// named `CopyForBVHUpdate` are dropped while the structure builder is off
+/// ([`is_bvh_copy_idle`]). After SAZLEIB/VIctory-7900XTX 95f62718, where
+/// they were dropped whenever the builder did not run, with no switch.
+#[cfg(windows)]
+fn bvh_skip_copy() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_SKIP_COPY").is_some_and(|v| v == "1"))
+}
+
+/// Whether the title's pipeline `this` is a copy that feeds the structure
+/// builder (a compute program named `CopyForBVHUpdate`) while the builder
+/// is off for certain ([`builder_off_now`]): taken, as the source does, to
+/// write only what the builder reads, so it can be dropped
+/// (`VICTORY_BVH_SKIP_COPY=1`; its shaders are looked at only then).
+#[cfg(windows)]
+pub(crate) fn is_bvh_copy_idle(this: This) -> bool {
+    !this.is_null() && pipeline(this).shaders.iter().any(|s| s.bvh_copy) && builder_off_now()
 }
 
 /// At a dispatch of a builder pipeline: whether the builder runs (see

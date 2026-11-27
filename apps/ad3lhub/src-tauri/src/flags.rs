@@ -486,6 +486,56 @@ pub fn catalog() -> Vec<FlagDef> {
             expert: true,
         },
         FlagDef {
+            key: "BVH_NO_HIT",
+            label: "BVH miss while unbuilt",
+            help: "Node tests miss immediately when the structure builder is off (FPS).",
+            category: "Lighting",
+            kind: FlagKind::Toggle,
+            choices: &[],
+            default: "1",
+            expert: true,
+        },
+        FlagDef {
+            key: "BVH_SKIP_COPY",
+            label: "Skip idle BVH copies",
+            help: "Drop CopyForBVHUpdate compute while the builder is off.",
+            category: "Lighting",
+            kind: FlagKind::Toggle,
+            choices: &[],
+            default: "1",
+            expert: true,
+        },
+        FlagDef {
+            key: "EARLY_DEPTH",
+            label: "Force early depth",
+            help: "Honor console early-depthstencil as ForceEarlyDepthStencil on the host.",
+            category: "Lighting",
+            kind: FlagKind::Toggle,
+            choices: &[],
+            default: "1",
+            expert: true,
+        },
+        FlagDef {
+            key: "VIEW_BYTES",
+            label: "Per-view buffer shadows",
+            help: "1 = shadow off-element buffer views (default old). 0 = leave null (FPS).",
+            category: "Performance",
+            kind: FlagKind::Toggle,
+            choices: &[],
+            default: "0",
+            expert: true,
+        },
+        FlagDef {
+            key: "WIDE_SPIN",
+            label: "Wide refresh spin (µs)",
+            help: "Spin this many microseconds before sleeping on wide refresh waits. 50 helped elsewhere.",
+            category: "Performance",
+            kind: FlagKind::Number,
+            choices: &[],
+            default: "50",
+            expert: true,
+        },
+        FlagDef {
             key: "TELEMETRY",
             label: "Fleet telemetry",
             help: "Send crash/perf telemetry for this NVIDIA fork. 0 disables.",
@@ -508,11 +558,11 @@ pub fn catalog() -> Vec<FlagDef> {
         FlagDef {
             key: "D3D12_DEBUG",
             label: "D3D12 debug layer",
-            help: "Names INVALID_CALL / UAV errors on device-removed (needs Graphics Tools).",
+            help: "Names INVALID_CALL on device-removed (needs Graphics Tools). Off for play FPS.",
             category: "Diagnostics",
             kind: FlagKind::Toggle,
             choices: &[],
-            default: "1",
+            default: "0",
             expert: true,
         },
         FlagDef {
@@ -538,11 +588,11 @@ pub fn catalog() -> Vec<FlagDef> {
         FlagDef {
             key: "D3D12_DRED",
             label: "DRED breadcrumbs",
-            help: "empty off; light = which list died; 1 = full markers (default).",
+            help: "empty off; light = which list; faults = page faults only; 1 = full markers.",
             category: "Diagnostics",
             kind: FlagKind::Choice,
             choices: &["", "light", "1", "faults"],
-            default: "1",
+            default: "faults",
             expert: true,
         },
     ]
@@ -649,8 +699,13 @@ pub fn preset_flags(id: &str) -> BTreeMap<String, String> {
             set(&mut m, "LEVELS_ON_DEMAND", "1");
             set(&mut m, "CARD_BUFFERS_MIN_KB", "64");
             set(&mut m, "LOG", "victory_gpu=info,victory_telemetry=info,warn");
-            set(&mut m, "D3D12_DRED", "1");
-            set(&mut m, "D3D12_DEBUG", "1");
+            set(&mut m, "D3D12_DRED", "faults");
+            set(&mut m, "D3D12_DEBUG", "0");
+            set(&mut m, "VIEW_BYTES", "0");
+            set(&mut m, "WIDE_SPIN", "50");
+            set(&mut m, "BVH_NO_HIT", "1");
+            set(&mut m, "BVH_SKIP_COPY", "1");
+            set(&mut m, "EARLY_DEPTH", "1");
             set(&mut m, "TEXTURE_DROP_MIPS", "2");
             set(&mut m, "NULL_COLOR", "grey");
             set(&mut m, "OVERLAY", "1");
@@ -701,8 +756,13 @@ pub fn preset_flags(id: &str) -> BTreeMap<String, String> {
                 "LOG",
                 "victory_gpu=info,victory_gpu::evidence=info,victory_hle=info,warn",
             );
-            set(&mut m, "D3D12_DRED", "1");
-            set(&mut m, "D3D12_DEBUG", "1");
+            set(&mut m, "D3D12_DRED", "faults");
+            set(&mut m, "D3D12_DEBUG", "0");
+            set(&mut m, "VIEW_BYTES", "0");
+            set(&mut m, "WIDE_SPIN", "50");
+            set(&mut m, "BVH_NO_HIT", "1");
+            set(&mut m, "BVH_SKIP_COPY", "1");
+            set(&mut m, "EARLY_DEPTH", "1");
         }
     }
     m

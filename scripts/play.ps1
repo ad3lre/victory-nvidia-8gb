@@ -18,7 +18,7 @@ $settings = @{
     # 0x887A0001 device-removed / AMD amdxc64 null). Re-enable only with the Wait fix.
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '0'; VICTORY_CARD_STEPS = '2'
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '1'
-    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = '1'; VICTORY_SKIP_PIPELINES = 'none'
+    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_SKIP_PIPELINES = 'none'
     # Scarlett/cool_fox evidence: LEVELS_ON_DEMAND=1 thrashed re-uploads; off
     # cut remakes ~6.4 GB -> 14 MB. FILL_TITLE skips waits on title-written
     # constants; longer bake wait for character/cutscene textures.
@@ -35,19 +35,40 @@ $settings = @{
     VICTORY_CARD_ROOM_FOR_BUFFERS = '0'
     VICTORY_CARD_WINDOWS_MB = '192'
     VICTORY_CARD_BUFFERS_MB = '256'
+    VICTORY_CARD_BUFFERS_MIN_KB = '64'
     VICTORY_TEXTURE_ROOM_PERCENT = '92'
     VICTORY_OVERLAY = '0'
-    # Observability: name INVALID_CALL on device-removed; keep GPU trail through boot.
-    # victory_gpu::evidence target: residency/compose/clamp line every second.
-    VICTORY_D3D12_DEBUG = '1'; VICTORY_TRAIL = '1'
+    # FPS pack from Nsight / foreign forks (play, not diagnose):
+    # - debug layer off (often ~2x); DRED page-faults only
+    # - VIEW_BYTES=0: drop per-view shadows under recording mutex (−27% frame elsewhere)
+    # - WIDE_SPIN: spin ≤50µs instead of sleep on wide refresh waits
+    # - BVH_NO_HIT + SKIP_COPY + EARLY_DEPTH: skip unbuilt RT walks / idle BVH copies / early-Z
+    VICTORY_D3D12_DEBUG = '0'
+    VICTORY_D3D12_DRED = 'faults'
+    VICTORY_VIEW_BYTES = '0'
+    VICTORY_WIDE_SPIN = '50'
+    VICTORY_BVH_NO_HIT = '1'
+    VICTORY_BVH_SKIP_COPY = '1'
+    VICTORY_EARLY_DEPTH = '1'
+    VICTORY_TRAIL = '1'
     VICTORY_LOG = 'victory_gpu=info,victory_gpu::evidence=info,victory_hle=info,warn'
 }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
+    # Safe: restore debug naming and keep views / RT walks as before.
+    $settings.VICTORY_D3D12_DEBUG = '1'
+    $settings.VICTORY_D3D12_DRED = '1'
+    $settings.VICTORY_VIEW_BYTES = '1'
+    $settings.Remove('VICTORY_BVH_NO_HIT')
+    $settings.Remove('VICTORY_BVH_SKIP_COPY')
+    $settings.Remove('VICTORY_EARLY_DEPTH')
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
-if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+if ($RayTracing) {
+    # Builder on: NO_HIT mode 2 (host USER_STRUCTURES); still skip idle copies until whole.
+    $settings.VICTORY_BVH_BUILDER = '1'
+}
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"

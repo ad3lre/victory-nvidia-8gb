@@ -65,7 +65,14 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Whether depth and stencil are tested before the program runs.
+    #[cfg(test)]
+    pub early_depth: bool,
 }
+
+/// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (AMD's register headers, as in
+/// Linux's `gc_10_3_0_sh_mask.h`).
+const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
 
 pub(crate) struct Parts<'a> {
     pub native: &'a NativeProgram,
@@ -1399,6 +1406,29 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        // `VICTORY_EARLY_DEPTH=1` ([`super::early_depth`]): the console tests
+        // depth and stencil before a pixel program its compiler marked
+        // `[earlydepthstencil]` (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`), so
+        // the program runs only for pixels that pass. The host must too
+        // (Marvisak/VIctory #2085, triippywhale b2413dd7): without the flag
+        // it runs a program that writes unordered views before the depth
+        // test, for hidden pixels as well, and keeps what they wrote.
+        if super::early_depth()
+            && let StageIo::Ps {
+                db_shader_control, ..
+            } = &x.native.io
+            && db_shader_control & DEPTH_BEFORE_SHADER != 0
+            // Not for a program that exports depth, stencil or coverage
+            // (Z_EXPORT_ENABLE, STENCIL_TEST_VAL/OP_VAL_EXPORT_ENABLE, bits
+            // 0-2, and COVERAGE_TO_MASK... bit 8 of the register; or such
+            // an output: semantic kinds 14 coverage, 17-19 depth, 20 stencil
+            // reference): the host cannot test before a program that writes
+            // them (fxceless/victory-fork#907, triippywhale a77c8b3f).
+            && db_shader_control & (0b111 | 1 << 8) == 0
+            && !x.outputs.iter().any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20))
+        {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -2452,6 +2482,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            early_depth: self.s.flags & flags::EARLY_DEPTH != 0,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,

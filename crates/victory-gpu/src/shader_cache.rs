@@ -83,6 +83,20 @@ fn build() -> [u8; 32] {
             }
             bytes.push(0);
         }
+        // How the ray node tests answer while the structures are not built
+        // (`VICTORY_BVH_NO_HIT=1` / `VICTORY_BVH_MISS=1`): the mode, which
+        // depends on `VICTORY_BVH_BUILDER` too (keyed this way so the
+        // builder's switch alone retranslates nothing). Only when on.
+        let no_hit = victory_shader::emit::bvh_no_hit();
+        if no_hit != 0 {
+            bytes.extend_from_slice(b"VICTORY_BVH_NO_HIT=");
+            bytes.push(b'0' + no_hit);
+        }
+        // Pixel programs the console tests depth before keep early depth
+        // (`VICTORY_EARLY_DEPTH=1`). Only when on.
+        if victory_shader::emit::early_depth() {
+            bytes.extend_from_slice(b"VICTORY_EARLY_DEPTH=1");
+        }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
         bytes

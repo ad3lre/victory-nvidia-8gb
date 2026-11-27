@@ -1342,6 +1342,12 @@ impl State {
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
             return 0;
         }
+        // Whether the ray-tracing structures are built: the node tests of a
+        // program that asks (`VICTORY_BVH_NO_HIT=1` with
+        // `VICTORY_BVH_BUILDER=1`) answer no hit at 0.
+        if kind == victory_shader::emit::USER_STRUCTURES {
+            return u32::from(crate::pipeline::builder_whole_now());
+        }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
             return match self.roots_ref(compute).get(usize::from(slot)) {
                 Some(&Root::View(address)) if kind == USER_ROOT_ADDRESS => address as u32,
@@ -3107,6 +3113,15 @@ impl State {
             }
             return;
         }
+        // `VICTORY_BVH_SKIP_COPY=1`: a copy that feeds the builder, which is off.
+        if crate::pipeline::is_bvh_copy_idle(self.pipeline as This) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why(
+                "CopyForBVHUpdate with the ray-tracing structure builder off".to_owned(),
+            );
+            return;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
@@ -4226,6 +4241,9 @@ impl State {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            return false;
+        }
+        if crate::pipeline::is_bvh_copy_idle(self.pipeline as This) {
             return false;
         }
         const DRAW: u32 = 0;
