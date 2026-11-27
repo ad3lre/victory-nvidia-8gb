@@ -660,13 +660,23 @@ pub fn preset_flags(id: &str) -> BTreeMap<String, String> {
         _ => {
             set(&mut m, "CONSOLE", "series-s");
             set(&mut m, "OWN_UPSCALER", "1");
-            set(&mut m, "RENDER_SCALE", "0.5");
             set(&mut m, "RESOLUTION", "1920x1080");
-            set(&mut m, "TEXTURE_DROP_MIPS", "2");
             set(&mut m, "NULL_COLOR", "grey");
             set(&mut m, "AMBIENT", "0.6");
             set(&mut m, "AMBIENT_AIR", "1.5");
-            set(&mut m, "LEVELS_ON_DEMAND", "1");
+            // Scarlett: LEVELS_ON_DEMAND=0 was their largest residency win.
+            set(&mut m, "LEVELS_ON_DEMAND", "0");
+            set(&mut m, "FILL_TITLE", "1");
+            set(&mut m, "BAKE_TEXTURES_MS", "10000");
+            // Aggressive 4 GB pack (GTX 1650 Series S slideshow that moved).
+            set(&mut m, "TEXTURE_DROP_MIPS", "4");
+            set(&mut m, "TEXTURE_MAX_DIM", "256");
+            set(&mut m, "RENDER_SCALE", "0.25");
+            set(&mut m, "CARD_ROOM_FOR_TARGETS_MB", "512");
+            set(&mut m, "CARD_ROOM_FOR_BUFFERS", "0");
+            set(&mut m, "CARD_WINDOWS_MB", "192");
+            set(&mut m, "CARD_BUFFERS_MB", "256");
+            set(&mut m, "TEXTURE_ROOM_PERCENT", "92");
             set(&mut m, "TEXTURE_NO_WAIT", "1");
             set(&mut m, "RELAY", "2");
             // RELAY_COPY left off (see FlagDef help / host.rs Wait fix).
@@ -684,9 +694,13 @@ pub fn preset_flags(id: &str) -> BTreeMap<String, String> {
             set(&mut m, "CARD_AWAKE", "1");
             set(&mut m, "SHOW_AFTER", "1");
             set(&mut m, "CARD_BUFFERS_MIN_KB", "64");
-            set(&mut m, "OVERLAY", "1");
+            set(&mut m, "OVERLAY", "0");
             set(&mut m, "TELEMETRY", "1");
-            set(&mut m, "LOG", "victory_gpu=info,victory_telemetry=info,warn");
+            set(
+                &mut m,
+                "LOG",
+                "victory_gpu=info,victory_gpu::evidence=info,victory_hle=info,warn",
+            );
             set(&mut m, "D3D12_DRED", "1");
             set(&mut m, "D3D12_DEBUG", "1");
         }

@@ -103,7 +103,12 @@ impl ResourceDesc {
     /// The texture of this one's levels from `base` on.
     fn levels_from(&self, base: u32) -> ResourceDesc {
         let mut d = *self;
-        if base > 0 {
+        // `mip_levels` is a `u16`. Subtracting a base past the chain wraps
+        // to tens of thousands of mips; CreateCommittedResource / the NVIDIA
+        // driver then fault instead of returning E_INVALIDARG. Keep at least
+        // the coarsest mip.
+        if base > 0 && d.mip_levels > 0 {
+            let base = base.min(u32::from(d.mip_levels - 1));
             d.width = (d.width >> base).max(1);
             d.height = (d.height >> base).max(1);
             d.mip_levels -= base as u16;
@@ -144,6 +149,87 @@ pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
         73..=78 | 82..=84 | 94..=99 => (16, 4),
         _ => return None,
     })
+}
+
+/// Whether a texture may be placed at 4 KiB (`D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT`).
+///
+/// The most detailed mip must fit in 16 tiles of 4 KiB (64 KiB total). This is
+/// the check the debug layer applies before error #721
+/// (`CREATERESOURCE_INVALIDALIGNMENT`). Calling `GetResourceAllocationInfo`
+/// with `Alignment = 4096` on anything larger is how that warning is produced,
+/// and GTX 1650 drivers access-violate in `nvwgf2umx` (null + `0x3c`) instead
+/// of returning `UINT64_MAX`. Same rule as D3D12MA's conservative
+/// `CanUseSmallAlignment`: single-sample 2D, not a render target or depth
+/// stencil, one array layer, a known 8/16/32/64/128-bit texel.
+pub(crate) fn small_placement(
+    texture_2d: bool,
+    width: u64,
+    height: u32,
+    layers: u16,
+    samples: u32,
+    format: u32,
+    render_or_depth: bool,
+) -> bool {
+    if !texture_2d || render_or_depth || samples != 1 || layers != 1 || width == 0 || height == 0 {
+        return false;
+    }
+    let Some((bytes, block)) = element(format) else {
+        return false;
+    };
+    if bytes == 0 || block == 0 {
+        return false;
+    }
+    // `element` is bytes per block. Uncompressed blocks are 1 texel, so
+    // `bytes * 8` is bits per texel. Compressed blocks are 4x4 texels and
+    // `bytes * 8` is already bits per block (BC7: 128), which is the figure
+    // the 4 KiB tile table wants after the dimensions are converted to blocks.
+    let mut size_x = width;
+    let mut size_y = u64::from(height);
+    let bits = bytes.saturating_mul(8);
+    if block > 1 {
+        size_x = size_x.div_ceil(block);
+        size_y = size_y.div_ceil(block);
+    }
+    let (tile_x, tile_y): (u64, u64) = match bits {
+        8 => (64, 64),
+        16 => (64, 32),
+        32 => (32, 32),
+        64 => (32, 16),
+        128 => (16, 16),
+        _ => return false,
+    };
+    size_x.div_ceil(tile_x).saturating_mul(size_y.div_ceil(tile_y)) <= 16
+}
+
+#[cfg(test)]
+mod small_placement_tests {
+    use super::small_placement;
+
+    fn rgba(width: u64, height: u32) -> bool {
+        // DXGI_FORMAT_R8G8B8A8_UNORM = 28, 32 bits, 32x32 tile.
+        small_placement(true, width, height, 1, 1, 28, false)
+    }
+
+    #[test]
+    fn four_kilobyte_placement_only_when_the_top_mip_fits_in_sixteen_tiles() {
+        assert!(rgba(32, 32));
+        assert!(rgba(128, 128));
+        assert!(!rgba(129, 128));
+        assert!(!rgba(256, 256));
+        // Debug layer #721 example: 1024x1024 RGBA needs 1024 tiles, max is 16.
+        assert!(!rgba(1024, 1024));
+        assert!(!rgba(0, 32));
+        assert!(!small_placement(true, 32, 32, 1, 1, 28, true), "render targets stay 64 KiB");
+        assert!(!small_placement(true, 32, 32, 6, 1, 28, false), "arrays stay 64 KiB");
+        assert!(!small_placement(true, 32, 32, 1, 4, 28, false), "msaa stays 64 KiB");
+        assert!(!small_placement(false, 32, 32, 1, 1, 28, false));
+        // BC7 (98) is 16 bytes per 4x4. 256x256 is 16 tiles; 512x512 is not.
+        assert!(small_placement(true, 256, 256, 1, 1, 98, false));
+        assert!(!small_placement(true, 512, 512, 1, 1, 98, false));
+        // BC1 (71) is 8 bytes per 4x4 (64 bits per block → 32x16 block tile).
+        assert!(small_placement(true, 512, 256, 1, 1, 71, false));
+        assert!(!small_placement(true, 1024, 256, 1, 1, 71, false));
+    }
 }
 
 /// A texture's layout in console memory, as the console's layout library
@@ -2367,8 +2453,16 @@ pub(crate) fn census() -> [u64; 10] {
             }
         }
     }
+    EVIDENCE_MISSING[0].store(count[2], std::sync::atomic::Ordering::Relaxed);
+    EVIDENCE_MISSING[1].store(count[3], std::sync::atomic::Ordering::Relaxed);
     count
 }
+
+/// Last [`census`] snapshot: title textures with no host copy, and their
+/// title-memory bytes. For the per-second evidence line.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) static EVIDENCE_MISSING: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Host textures alive (the title's and the twins) and the bytes the host
 /// gives them, for the memory line.

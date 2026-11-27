@@ -2668,6 +2668,15 @@ fn late_exact() -> bool {
 /// or listed is presented the old way. Once every second and a half a
 /// submission settles the flights all the same, for the sweep that lets
 /// idle host objects go (it needs nothing in the air).
+/// Presents that carried a Series S overlay plane vs base-only (evidence).
+pub(crate) static EVIDENCE_COMPOSE_OVERLAY: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static EVIDENCE_COMPOSE_BASE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Movie-plane uploads run since the last evidence line (count, bytes).
+pub(crate) static EVIDENCE_MOVIE: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Draws/frame at which the boot / banner window ends (banners sit ~8–10;
 /// the world jumps well above this). Sticky once crossed.
 pub(crate) const INTRO_DRAWS_PER_FRAME: f64 = 64.0;
@@ -7818,6 +7827,8 @@ impl HostList {
                     fill();
                     PREPARING[2].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
                     PREPARING[3].fetch_add(*len as u64, Ordering::Relaxed);
+                    EVIDENCE_MOVIE[0].fetch_add(1, Ordering::Relaxed);
+                    EVIDENCE_MOVIE[1].fetch_add(*len as u64, Ordering::Relaxed);
                     continue;
                 }
             };
@@ -9339,6 +9350,40 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            // One tight line for residency / compose / clamp / movie hypotheses
+            // (Scarlett LEVELS_ON_DEMAND=0, FILL_TITLE, two-plane compose).
+            #[cfg(feature = "diagnostics")]
+            {
+                let missing = crate::resource::EVIDENCE_MISSING[0].load(Ordering::Relaxed);
+                let missing_mb = crate::resource::EVIDENCE_MISSING[1].load(Ordering::Relaxed) >> 20;
+                let overlay = EVIDENCE_COMPOSE_OVERLAY.swap(0, Ordering::Relaxed);
+                let base_only = EVIDENCE_COMPOSE_BASE.swap(0, Ordering::Relaxed);
+                let clamped = crate::descriptor::host::SRV_CLAMPED.load(Ordering::Relaxed);
+                let movie_n = EVIDENCE_MOVIE[0].swap(0, Ordering::Relaxed);
+                let movie_mb = EVIDENCE_MOVIE[1].swap(0, Ordering::Relaxed) >> 20;
+                // Cumulative since start (memory line owns these counters).
+                let sweep_n = crate::resource::KINDS[2].load(Ordering::Relaxed);
+                let sweep_mb = crate::resource::KINDS[3].load(Ordering::Relaxed) >> 20;
+                tracing::info!(
+                    target: "victory_gpu::evidence",
+                    intro = intro_active(),
+                    levels_on_demand = crate::tiles::wanted(),
+                    fill_title = std::env::var_os("VICTORY_FILL_TITLE").is_some_and(|v| v == "1"),
+                    drop_mips = crate::texture::drop_mips(),
+                    show_after = crate::descriptor::host::show_after(),
+                    missing_host = missing,
+                    missing_mb,
+                    compose_overlay = overlay,
+                    compose_base = base_only,
+                    srv_clamped = clamped,
+                    movie_planes = movie_n,
+                    movie_mb,
+                    sweep_gone = sweep_n,
+                    sweep_mb,
+                    draws,
+                    "evidence residency/compose/clamp"
+                );
+            }
             if !self.boot_stall_warned
                 && draws <= 20.0
                 && self.boot_at.elapsed() >= std::time::Duration::from_secs(30)
@@ -9488,6 +9533,11 @@ impl Host {
         overlay: Option<(&ID3D12Resource, u32)>,
         frame: u64,
     ) -> Option<bool> {
+        if overlay.is_some() {
+            EVIDENCE_COMPOSE_OVERLAY.fetch_add(1, Ordering::Relaxed);
+        } else {
+            EVIDENCE_COMPOSE_BASE.fetch_add(1, Ordering::Relaxed);
+        }
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let planes = overlay.and_then(|(over, over_state)| {

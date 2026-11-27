@@ -1060,7 +1060,10 @@ fn record_upload(
     const COPY_DEST: u32 = 0x400;
     // A texture cut from a block may lie where another did: what the card
     // holds of that one is done with before the first upload into this one.
-    if crate::pool::on() && !staging.uploaded.load(Relaxed) {
+    // Committed fallbacks (pool on, but this copy was not placed) must not
+    // get the barrier: nvwgf2umx reads the placed-heap pointer and faults
+    // at null+0x3c when the resource has none.
+    if !staging.uploaded.load(Relaxed) && crate::pool::placed_in_block(texture) {
         let aliasing = D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -1074,6 +1077,13 @@ fn record_upload(
         };
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[aliasing]) };
+    } else if !staging.uploaded.load(Relaxed) && crate::pool::on() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::info!(
+                "texture upload: no aliasing barrier on a committed copy (the pool is on; NVIDIA faults on aliasing barriers for committed textures)"
+            );
+        });
     }
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging/plane upload buffer lives until the list is reset.

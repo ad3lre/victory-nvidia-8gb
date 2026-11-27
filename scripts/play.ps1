@@ -19,9 +19,28 @@ $settings = @{
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '0'; VICTORY_CARD_STEPS = '2'
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '1'
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = '1'; VICTORY_SKIP_PIPELINES = 'none'
+    # Scarlett/cool_fox evidence: LEVELS_ON_DEMAND=1 thrashed re-uploads; off
+    # cut remakes ~6.4 GB -> 14 MB. FILL_TITLE skips waits on title-written
+    # constants; longer bake wait for character/cutscene textures.
+    VICTORY_LEVELS_ON_DEMAND = '0'; VICTORY_FILL_TITLE = '1'; VICTORY_BAKE_TEXTURES_MS = '10000'
+    # Aggressive 4 GB (GTX 1650) pack that got a moving Series-S world on screen:
+    # drop finest mips, cap uploads, shrink target reservation (default 3072 MB
+    # made room() false ~1 GB uploaded), half Series-S scale again.
+    VICTORY_TEXTURE_DROP_MIPS = '4'
+    VICTORY_TEXTURE_MAX_DIM = '256'
+    VICTORY_NULL_COLOR = 'grey'
+    VICTORY_OWN_UPSCALER = '1'
+    VICTORY_RENDER_SCALE = '0.25'
+    VICTORY_CARD_ROOM_FOR_TARGETS_MB = '512'
+    VICTORY_CARD_ROOM_FOR_BUFFERS = '0'
+    VICTORY_CARD_WINDOWS_MB = '192'
+    VICTORY_CARD_BUFFERS_MB = '256'
+    VICTORY_TEXTURE_ROOM_PERCENT = '92'
+    VICTORY_OVERLAY = '0'
     # Observability: name INVALID_CALL on device-removed; keep GPU trail through boot.
+    # victory_gpu::evidence target: residency/compose/clamp line every second.
     VICTORY_D3D12_DEBUG = '1'; VICTORY_TRAIL = '1'
-    VICTORY_LOG = 'victory_gpu=info,victory_telemetry=info,warn'
+    VICTORY_LOG = 'victory_gpu=info,victory_gpu::evidence=info,victory_hle=info,warn'
 }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'

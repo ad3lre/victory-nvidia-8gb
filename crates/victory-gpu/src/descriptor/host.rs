@@ -4466,47 +4466,76 @@ fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32) {
     }
 }
 
+/// How many shader views had their mip window cut to fit the host copy
+/// (evidence: DROP_MIPS / held_only / levels-on-demand mismatch).
+pub(crate) static SRV_CLAMPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Clamps a shader view's mip window to a host texture of `host_mips` levels.
 fn clamp_srv_to_host_mips(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, host_mips: u32) {
     let host_mips = host_mips.max(1);
-    let clamp = |most: &mut u32, mips: &mut u32| {
+    let clamp = |most: &mut u32, mips: &mut u32, min_lod: &mut f32| {
+        let before = (*most, *mips, *min_lod);
         if *most >= host_mips {
             *most = host_mips - 1;
             *mips = 1;
-            return;
+        } else {
+            let remain = host_mips - *most;
+            if *mips != u32::MAX && (*mips == 0 || *mips > remain) {
+                *mips = remain;
+            }
         }
-        let remain = host_mips - *most;
-        if *mips == u32::MAX {
-            // all remaining levels — valid as-is
-        } else if *mips == 0 || *mips > remain {
-            *mips = remain;
+        // ResourceMinLODClamp is an index into the resource. It must be
+        // finite and no greater than the last mip this view can see.
+        // DROP_MIPS / MAX_DIM leave the title's clamp pointing past a
+        // shortened host chain; NVIDIA access-violates in CreateShaderResourceView
+        // instead of returning an error when the debug layer is off.
+        let span = if *mips == u32::MAX { host_mips - *most } else { (*mips).max(1) };
+        let last = (*most + span - 1) as f32;
+        if !min_lod.is_finite() || *min_lod < 0.0 {
+            *min_lod = 0.0;
+        } else if *min_lod > last {
+            *min_lod = last;
+        }
+        if before != (*most, *mips, *min_lod) {
+            SRV_CLAMPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     };
     match desc.ViewDimension {
         D3D12_SRV_DIMENSION_TEXTURE2D => {
             // SAFETY: the member its dimension says.
             let t = unsafe { &mut desc.Anonymous.Texture2D };
-            clamp(&mut t.MostDetailedMip, &mut t.MipLevels);
+            clamp(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
         }
         D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
             // SAFETY: the member its dimension says.
             let t = unsafe { &mut desc.Anonymous.Texture2DArray };
-            clamp(&mut t.MostDetailedMip, &mut t.MipLevels);
+            clamp(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
         }
         D3D12_SRV_DIMENSION_TEXTURE3D => {
             // SAFETY: the member its dimension says.
             let t = unsafe { &mut desc.Anonymous.Texture3D };
-            clamp(&mut t.MostDetailedMip, &mut t.MipLevels);
+            clamp(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
         }
         D3D12_SRV_DIMENSION_TEXTURE1D => {
             // SAFETY: the member its dimension says.
             let t = unsafe { &mut desc.Anonymous.Texture1D };
-            clamp(&mut t.MostDetailedMip, &mut t.MipLevels);
+            clamp(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
         }
         D3D12_SRV_DIMENSION_TEXTURE1DARRAY => {
             // SAFETY: the member its dimension says.
             let t = unsafe { &mut desc.Anonymous.Texture1DArray };
-            clamp(&mut t.MostDetailedMip, &mut t.MipLevels);
+            clamp(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBE => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.TextureCube };
+            clamp(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.TextureCubeArray };
+            clamp(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
         }
         _ => {}
     }
@@ -4538,6 +4567,48 @@ mod srv_mip_clamp_tests {
         let t = unsafe { desc.Anonymous.Texture2D };
         assert_eq!(t.MostDetailedMip, 3);
         assert_eq!(t.MipLevels, 3);
+    }
+
+    #[test]
+    fn clamp_pulls_min_lod_and_cube_mips_back_onto_a_short_host_chain() {
+        let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: 5768,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 4.0,
+                },
+            },
+        };
+        clamp_srv_to_host_mips(&mut desc, 1);
+        // SAFETY: TEXTURE2D.
+        let t = unsafe { desc.Anonymous.Texture2D };
+        assert_eq!(t.MostDetailedMip, 0);
+        assert_eq!(t.MipLevels, 1);
+        assert_eq!(t.ResourceMinLODClamp, 0.0);
+
+        let mut cube = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE,
+            Shader4ComponentMapping: 5768,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                TextureCube: D3D12_TEXCUBE_SRV {
+                    MostDetailedMip: 5,
+                    MipLevels: 4,
+                    ResourceMinLODClamp: 6.0,
+                },
+            },
+        };
+        clamp_srv_to_host_mips(&mut cube, 3);
+        // SAFETY: TEXTURECUBE.
+        let c = unsafe { cube.Anonymous.TextureCube };
+        assert_eq!(c.MostDetailedMip, 2);
+        assert_eq!(c.MipLevels, 1);
+        assert_eq!(c.ResourceMinLODClamp, 2.0);
     }
 
     #[test]

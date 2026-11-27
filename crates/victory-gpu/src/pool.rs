@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
@@ -593,15 +593,28 @@ fn made_now(texture: &ID3D12Resource) {
     recent.push_back((texture.as_raw() as usize, now));
 }
 
+/// Private data on a texture cut from a pool block ([`give_back_with`]).
+const RECLAIM_KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
+
+/// Whether `texture` was cut from a pool block. Committed fallbacks have no
+/// such key. An aliasing barrier is only legal for the placed ones: NVIDIA
+/// reads the placed-heap pointer and access-violates when it is null.
+pub(crate) fn placed_in_block(texture: &ID3D12Resource) -> bool {
+    let mut size = 0u32;
+    // SAFETY: `size` is ours. A null buffer only asks whether the key is set;
+    // a hit writes the needed size (and returns MORE_DATA).
+    let _ = unsafe { texture.GetPrivateData(&RECLAIM_KEY, &mut size, None) };
+    size != 0
+}
+
 /// Makes `texture` give `piece` back when the last reference to it goes.
 fn give_back_with(texture: &ID3D12Resource, piece: Piece, target: bool) {
-    const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
     let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, target }));
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
     unsafe {
         let object = IUnknown::from_raw(made.cast());
-        if texture.SetPrivateDataInterface(&KEY, &object).is_err() {
+        if texture.SetPrivateDataInterface(&RECLAIM_KEY, &object).is_err() {
             // Never given back: the piece stays taken, nothing is reused
             // under a texture that may be alive.
             std::mem::forget(object);
@@ -631,14 +644,41 @@ pub(crate) unsafe fn texture(
     if !on() {
         return None;
     }
-    // Small textures lie at multiples of 4 KiB where the host allows it
-    // (the top mip is 64 KiB at most): 64 KiB each otherwise.
     // SAFETY: the caller's description.
     let mut d = unsafe { *desc };
-    d.Alignment = u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT);
-    // SAFETY: plain queries.
+    // 4 KiB placement only when the top mip is known to fit in 16 tiles.
+    // Querying Alignment=4096 otherwise is debug-layer error #721, and
+    // nvwgf2umx on a GTX 1650 access-violates (null + 0x3c) instead of
+    // returning ~0. Anything else stays at the driver's default (64 KiB).
+    let render_or_depth = d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+        || d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    let try_small = crate::resource::small_placement(
+        d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        d.Width,
+        d.Height,
+        d.DepthOrArraySize,
+        d.SampleDesc.Count,
+        d.Format.0 as u32,
+        render_or_depth,
+    );
+    if try_small {
+        d.Alignment = u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT);
+    } else {
+        d.Alignment = 0;
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                width = d.Width,
+                height = d.Height,
+                format = d.Format.0,
+                "texture pool: 64 KiB alignment (4 KiB placement refused; NVIDIA faults on GetResourceAllocationInfo Alignment=4096)"
+            );
+        }
+    }
+    // SAFETY: plain queries. The 4 KiB query runs only for a desc the
+    // small-placement rule already accepts.
     let mut info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
-    if info.SizeInBytes == u64::MAX || info.Alignment != d.Alignment {
+    if try_small && (info.SizeInBytes == u64::MAX || info.Alignment != d.Alignment) {
         d.Alignment = 0;
         info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
     }
