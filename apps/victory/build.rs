@@ -9,7 +9,7 @@ const AGILITY_URL: &str =
 struct AgilityDll {
     /// Path inside the nupkg.
     member: &'static str,
-    /// File name under `.\D3D12\` next to the exe.
+    /// File name under `.\D3D12\` next to the exe (and under the vendored folder).
     file: &'static str,
     sha256: &'static str,
 }
@@ -31,6 +31,8 @@ const AGILITY_DLLS: &[AgilityDll] = &[
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=D3D12/D3D12Core.dll");
+    println!("cargo:rerun-if-changed=D3D12/d3d12SDKLayers.dll");
     println!("cargo:rerun-if-env-changed=VICTORY_SKIP_AGILITY_FETCH");
 
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
@@ -55,6 +57,7 @@ fn main() {
 
 fn ensure_agility() -> io::Result<PathBuf> {
     let dest_dir = exe_dir()?.join("D3D12");
+    let vendor_dir = vendor_dir()?;
     let missing: Vec<&AgilityDll> = AGILITY_DLLS
         .iter()
         .filter(|dll| !dll_ok(&dest_dir.join(dll.file), dll.sha256).unwrap_or(false))
@@ -62,16 +65,36 @@ fn ensure_agility() -> io::Result<PathBuf> {
     if missing.is_empty() {
         return Ok(dest_dir.join(AGILITY_DLLS[0].file));
     }
+
+    fs::create_dir_all(&dest_dir)?;
+
+    // Prefer the copies committed under apps/victory/D3D12/ (offline builds).
+    let mut still_missing = Vec::new();
+    for dll in missing {
+        let vendor = vendor_dir.join(dll.file);
+        if dll_ok(&vendor, dll.sha256).unwrap_or(false) {
+            let dest = dest_dir.join(dll.file);
+            let tmp = dest.with_extension("dll.part");
+            fs::copy(&vendor, &tmp)?;
+            fs::rename(&tmp, &dest)?;
+            continue;
+        }
+        still_missing.push(dll);
+    }
+    if still_missing.is_empty() {
+        return Ok(dest_dir.join(AGILITY_DLLS[0].file));
+    }
+
     if std::env::var_os("VICTORY_SKIP_AGILITY_FETCH").is_some() {
         return Err(io::Error::other(
-            "VICTORY_SKIP_AGILITY_FETCH is set and Agility DLLs are missing",
+            "VICTORY_SKIP_AGILITY_FETCH is set and Agility DLLs are missing from target and apps/victory/D3D12",
         ));
     }
-    fs::create_dir_all(&dest_dir)?;
+
     let nupkg = download_agility_nupkg()?;
     let mut archive = zip::ZipArchive::new(Cursor::new(nupkg))
         .map_err(|error| io::Error::other(format!("open nupkg: {error}")))?;
-    for dll in missing {
+    for dll in still_missing {
         let mut entry = archive.by_name(dll.member).map_err(|error| {
             io::Error::other(format!("nupkg missing {}: {error}", dll.member))
         })?;
@@ -84,6 +107,13 @@ fn ensure_agility() -> io::Result<PathBuf> {
         fs::rename(&tmp, &dest)?;
     }
     Ok(dest_dir.join(AGILITY_DLLS[0].file))
+}
+
+fn vendor_dir() -> io::Result<PathBuf> {
+    let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "CARGO_MANIFEST_DIR unset")
+    })?);
+    Ok(manifest.join("D3D12"))
 }
 
 fn exe_dir() -> io::Result<PathBuf> {

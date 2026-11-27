@@ -30,6 +30,6 @@ Applying `sendronbrian02-sudo@dea50eda` (slot 0x218 creates a pipeline from the 
 
 ## Windows 11 21H2 note
 
-On Windows 11 21H2 the in-box D3D12 refuses the root-signature flags `0xC01` (`ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT | CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | SAMPLER_HEAP_DIRECTLY_INDEXED`): every graphics root signature is refused and the title crashes. Exporting `D3D12SDKVersion` 620 and `D3D12SDKPath` with `D3D12Core.dll` 620 beside the exe fixes it. The `apps/victory/src/agility.rs`, `apps/victory/build.rs` and the `mod agility;` in `main.rs` in this branch are that fix; `build.rs` downloads the pinned 1.620.2 DLL into `target\<profile>\D3D12\` on MSVC builds (not committed).
+On Windows 11 21H2 the in-box D3D12 refuses the root-signature flags `0xC01` (`ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT | CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | SAMPLER_HEAP_DIRECTLY_INDEXED`): every graphics root signature is refused and the title crashes. Exporting `D3D12SDKVersion` 620 and `D3D12SDKPath` with `D3D12Core.dll` 620 beside the exe fixes it. The `apps/victory/src/agility.rs`, `apps/victory/build.rs` and the `mod agility;` in `main.rs` in this branch are that fix; the pinned 1.620.2 DLLs live in `apps/victory/D3D12/` and `build.rs` copies them into `target\<profile>\D3D12\` on MSVC builds.
 
 No game files, shaders, textures, audio or logs are included. Tested and written with AI assistance.

@@ -29,10 +29,20 @@ const ALLOWED_NAMES: &[&str] = &[
 ];
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
-const EXCEPTIONS: &[(&str, &str)] = &[(
-    "crates/victory-formats/src/bcpack-tables.bin",
-    "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
-)];
+const EXCEPTIONS: &[(&str, &str)] = &[
+    (
+        "crates/victory-formats/src/bcpack-tables.bin",
+        "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
+    ),
+    (
+        "apps/victory/D3D12/D3D12Core.dll",
+        "Microsoft Direct3D Agility SDK 1.620.2 redistributable: older Windows D3D12 runtimes need app-local D3D12Core (docs/asset-policy.md)",
+    ),
+    (
+        "apps/victory/D3D12/d3d12SDKLayers.dll",
+        "Matching Agility SDK layers DLL for VICTORY_D3D12_DEBUG (same 1.620.2 package as D3D12Core)",
+    ),
+];
 
 /// Signatures of formats that must never be committed.
 const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[

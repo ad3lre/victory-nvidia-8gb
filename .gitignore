@@ -35,6 +35,11 @@
 *.exp
 *.ilk
 
+# Microsoft D3D12 Agility SDK 1.620.2 redistributables (not game assets).
+# See apps/victory/D3D12/README.md and xtask policy EXCEPTIONS.
+!apps/victory/D3D12/
+!apps/victory/D3D12/**
+
 # Console packages and containers
 *.xvd
 *.xvc

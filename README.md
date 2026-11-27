@@ -7,13 +7,14 @@ Leo-styled Windows launcher for this fork and other VIctory projects: see [`apps
 ## Older Windows D3D12 runtimes
 
 The integration retains the NVIDIA fork's D3D12 Agility SDK 620 exports.
-`apps/victory/build.rs` downloads Microsoft.Direct3D.D3D12 **1.620.2** from
-NuGet during `cargo build` (MSVC targets) and installs
-`target\<profile>\D3D12\D3D12Core.dll` next to `victory.exe`, verified by
-SHA-256. Keep that `D3D12` folder beside any copied executable.
+`D3D12Core.dll` and `d3d12SDKLayers.dll` (**1.620.2**) are vendored under
+[`apps/victory/D3D12/`](apps/victory/D3D12/); `apps/victory/build.rs` copies
+them to `target\<profile>\D3D12\` next to `victory.exe` on MSVC builds
+(SHA-256 verified), with NuGet as fallback if a vendored file is missing.
+Keep that `D3D12` folder beside any copied executable.
 
-Skip the fetch with `VICTORY_SKIP_AGILITY_FETCH=1` only when the DLL is
-already present. Manual package URL (same bytes build.rs uses):
+Skip the network fallback with `VICTORY_SKIP_AGILITY_FETCH=1` when the
+vendored (or already-installed) DLLs are present. Package URL:
 
 <https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.d3d12/1.620.2/microsoft.direct3d.d3d12.1.620.2.nupkg>
 
